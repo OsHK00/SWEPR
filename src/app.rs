@@ -250,7 +250,10 @@ unsafe extern "system" fn wnd_proc(
                     let fit_mode = state.config.lock().unwrap().fit_mode.clone();
                     let style = WallpaperStyle::from_str(&fit_mode);
                     match state.wallpaper_manager.set_wallpaper(&path, None, style) {
-                        Ok(_) => log_info!("Wallpaper aplicado correctamente."),
+                        Ok(_) => {
+                            log_info!("Wallpaper aplicado correctamente.");
+                            crate::panel::set_current_wallpaper(&path);
+                        }
                         Err(e) => log_error!("Error al aplicar wallpaper: {e}"),
                     }
                 }

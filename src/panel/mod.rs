@@ -6,7 +6,7 @@ use crate::winutil::{as_pcwstr, to_wide_chars};
 use std::sync::{Arc, Mutex};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateSolidBrush, DeleteDC, DeleteObject, EndPaint, FillRect, GetMonitorInfoW, MonitorFromPoint, SelectObject, SetStretchBltMode, StretchBlt, COLORONCOLOR, MONITOR_DEFAULTTONEAREST, MONITORINFO, SRCCOPY,
+    BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateRoundRectRgn, CreateSolidBrush, DeleteDC, DeleteObject, EndPaint, FillRect, FrameRgn, GetMonitorInfoW, MonitorFromPoint, SelectClipRgn, SelectObject, SetStretchBltMode, StretchBlt, COLORONCOLOR, MONITOR_DEFAULTTONEAREST, MONITORINFO, SRCCOPY,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -62,6 +62,7 @@ static PANEL_LAST_MOUSE_X: Mutex<i32> = Mutex::new(0);
 static PANEL_PENDING_APPLY: Mutex<Option<usize>> = Mutex::new(None);
 static PANEL_HOVER_SCALE: Mutex<f32> = Mutex::new(1.0);
 static PANEL_HOVER_ANIM: Mutex<Option<HoverAnim>> = Mutex::new(None);
+static PANEL_CURRENT_WALLPAPER: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
 
 unsafe extern "system" fn panel_wnd_proc(
     hwnd: HWND,
@@ -81,7 +82,7 @@ unsafe extern "system" fn panel_wnd_proc(
                         if st.animating {
                             let elapsed = st.anim_start_time.elapsed().as_millis() as f32;
                             let progress = (elapsed / (ANIM_DURATION_MS as f32)).min(1.0);
-                            let eased = 1.0 - (1.0 - progress).powi(2);
+                            let eased = 1.0 - (1.0 - progress).powi(3);
                             let y = st.start_y + ((st.target_y - st.start_y) as f32 * eased) as i32;
                             st.current_y = y;
                             let px = if let Ok(g) = PANEL_X.lock() { *g } else { 0 };
@@ -162,6 +163,7 @@ unsafe extern "system" fn panel_wnd_proc(
                 let scroll = if let Ok(g) = PANEL_SCROLL_OFFSET.lock() { *g } else { 0 };
                 let hover = if let Ok(g) = PANEL_HOVER_INDEX.lock() { *g } else { None };
                 let hover_scale = if let Ok(g) = PANEL_HOVER_SCALE.lock() { *g } else { 1.0 };
+                let current_wp = if let Ok(g) = PANEL_CURRENT_WALLPAPER.lock() { g.clone() } else { None };
 
 
                 if let (Some(cache), Some(images_arc)) = (cache_opt, images_opt) {
@@ -172,6 +174,9 @@ unsafe extern "system" fn panel_wnd_proc(
                             let scale = if hover == Some(idx) { hover_scale } else { 1.0 };
                             let tw = (THUMB_SIZE as f32 * scale) as i32;
                             let draw_w = if hover == Some(idx) { tw } else { THUMB_SIZE };
+                            let radius = 8i32;
+                            let clip_rgn = CreateRoundRectRgn(x, 8, x + draw_w, 8 + draw_w, radius * 2, radius * 2);
+                            let _ = SelectClipRgn(mem_dc, clip_rgn);
                             if let Some(thumb) = cache.get(&key) {
                                 let bmp_dc = CreateCompatibleDC(hdc);
                                 let old = SelectObject(bmp_dc, windows::Win32::Graphics::Gdi::HBITMAP(thumb.hbitmap as *mut _));
@@ -185,14 +190,40 @@ unsafe extern "system" fn panel_wnd_proc(
                                 let _ = FillRect(mem_dc, &r, ph);
                                 let _ = DeleteObject(ph);
                             }
-                            if hover == Some(idx) {
-                                // Línea blanca superior sobre la miniatura enfocada
-                                let line_brush = CreateSolidBrush(windows::Win32::Foundation::COLORREF(0x00FFFFFF));
-                                let line_rect = RECT { left: x, top: 8, right: x + draw_w, bottom: 8 + THUMB_LINE_THICK };
-                                let _ = FillRect(mem_dc, &line_rect, line_brush);
-                                let _ = DeleteObject(line_brush);
+                            let _ = SelectClipRgn(mem_dc, windows::Win32::Graphics::Gdi::HRGN(std::ptr::null_mut()));
+                            let _ = DeleteObject(clip_rgn);
+                            let is_current = current_wp.as_ref().map(|p| p == &img.path).unwrap_or(false);
+                            if is_current || hover == Some(idx) {
+                                let color = if hover == Some(idx) {
+                                    windows::Win32::Foundation::COLORREF(0x00FFFFFF)
+                                } else {
+                                    windows::Win32::Foundation::COLORREF(0x0000FF00)
+                                };
+                                let rgn = CreateRoundRectRgn(x, 8, x + draw_w, 8 + draw_w, radius * 2, radius * 2);
+                                let brush = CreateSolidBrush(color);
+                                let _ = FrameRgn(mem_dc, rgn, brush, 2, 2);
+                                let _ = DeleteObject(brush);
+                                let _ = DeleteObject(rgn);
                             }
                             x += THUMB_SIZE + THUMB_MARGIN;
+                        }
+                        let total_w = images.len() as i32 * (THUMB_SIZE + THUMB_MARGIN) + THUMB_MARGIN;
+                        if total_w > width {
+                            let track_y = height - 4;
+                            let track_h = 3;
+                            let track_brush = CreateSolidBrush(windows::Win32::Foundation::COLORREF(0x00404040));
+                            let track_rect = RECT { left: 0, top: track_y, right: width, bottom: track_y + track_h };
+                            let _ = FillRect(mem_dc, &track_rect, track_brush);
+                            let _ = DeleteObject(track_brush);
+
+                            let max_scroll = (total_w - width).max(1);
+                            let mut thumb_w = ((width as f32 / total_w as f32) * width as f32) as i32;
+                            thumb_w = thumb_w.max(20).min(width);
+                            let thumb_x = ((scroll as f32 / max_scroll as f32) * (width - thumb_w) as f32) as i32;
+                            let thumb_brush = CreateSolidBrush(windows::Win32::Foundation::COLORREF(0x00FFFFFF));
+                            let thumb_rect = RECT { left: thumb_x, top: track_y, right: thumb_x + thumb_w, bottom: track_y + track_h };
+                            let _ = FillRect(mem_dc, &thumb_rect, thumb_brush);
+                            let _ = DeleteObject(thumb_brush);
                         }
                     }
                 }
@@ -490,6 +521,13 @@ pub fn set_draw_context(cache: ThumbnailCache, images: Arc<Mutex<Vec<ScannedImag
     if let Ok(mut g) = PANEL_THUMB_CACHE.lock() { *g = Some(cache); }
     if let Ok(mut g) = PANEL_SCANNED.lock() { *g = Some(images); }
     // Forzar repintado
+    request_repaint();
+}
+
+pub fn set_current_wallpaper(path: &std::path::Path) {
+    if let Ok(mut g) = PANEL_CURRENT_WALLPAPER.lock() {
+        *g = Some(path.to_path_buf());
+    }
     request_repaint();
 }
 
