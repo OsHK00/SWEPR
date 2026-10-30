@@ -5,7 +5,7 @@ use std::fs::{create_dir_all, File};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
-use crate::detector::zones::ZoneConfig;
+use crate::detector::zones::{ZoneConfig, ZoneType};
 use crate::log_info;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -61,7 +61,9 @@ impl AppConfig {
         if let Ok(mut file) = File::open(&path) {
             let mut contents = String::new();
             if file.read_to_string(&mut contents).is_ok() {
-                if let Ok(config) = serde_json::from_str::<AppConfig>(&contents) {
+                if let Ok(mut config) = serde_json::from_str::<AppConfig>(&contents) {
+                    // Desactivar zonas laterales (izquierda/derecha) por diseño
+                    config.zones.active_zones.retain(|z| !matches!(z, ZoneType::Left | ZoneType::Right));
                     log_info!("Configuración general cargada desde {:?}", path);
                     return config;
                 }

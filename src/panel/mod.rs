@@ -21,7 +21,8 @@ const AUTO_CLOSE_TIMER_ID: usize = 8002;
 const ANIM_DURATION_MS: i32 = 200;
 const ANIM_STEP_MS: u32 = 16;
 const AUTO_CLOSE_CHECK_MS: u32 = 100;
-const THUMB_SIZE: i32 = 100;
+const THUMB_W: i32 = 160;
+const THUMB_H: i32 = 90;
 const THUMB_MARGIN: i32 = 8;
 const THUMB_LINE_THICK: i32 = 2;
 const HOVER_SCALE: f32 = 1.1;
@@ -111,13 +112,13 @@ unsafe extern "system" fn panel_wnd_proc(
                                 if let Some(ref mut st) = *stg {
                                     let px = if let Ok(g) = PANEL_X.lock() { *g } else { 0 };
                                     let pw = if let Ok(g) = PANEL_WIDTH.lock() { *g } else { 800 };
-                                    let panel_h = (8.0 + THUMB_SIZE as f32 * s + THUMB_LINE_THICK as f32) as i32;
+                                    let panel_h = (8.0 + THUMB_H as f32 * s + THUMB_LINE_THICK as f32) as i32;
                                     let _ = SetWindowPos(hwnd, HWND_TOPMOST, px, st.current_y, pw, panel_h, SWP_NOACTIVATE | SWP_NOZORDER);
                                     if progress >= 1.0 {
                                         a.animating = false;
                                         let _ = KillTimer(hwnd, HOVER_ANIM_TIMER_ID);
                                         if a.target_scale == 1.0 {
-                                            let _ = SetWindowPos(hwnd, HWND_TOPMOST, px, st.current_y, pw, 8 + THUMB_SIZE, SWP_NOACTIVATE | SWP_NOZORDER);
+                                            let _ = SetWindowPos(hwnd, HWND_TOPMOST, px, st.current_y, pw, 8 + THUMB_H, SWP_NOACTIVATE | SWP_NOZORDER);
                                         }
                                     }
                                 }
@@ -172,21 +173,23 @@ unsafe extern "system" fn panel_wnd_proc(
                         for (idx, img) in images.iter().enumerate() {
                             let key = img.path.to_string_lossy().to_string();
                             let scale = if hover == Some(idx) { hover_scale } else { 1.0 };
-                            let tw = (THUMB_SIZE as f32 * scale) as i32;
-                            let draw_w = if hover == Some(idx) { tw } else { THUMB_SIZE };
+                            let tw = (THUMB_W as f32 * scale) as i32;
+                            let th = (THUMB_H as f32 * scale) as i32;
+                            let draw_w = if hover == Some(idx) { tw } else { THUMB_W };
+                            let draw_h = if hover == Some(idx) { th } else { THUMB_H };
                             let radius = 8i32;
-                            let clip_rgn = CreateRoundRectRgn(x, 8, x + draw_w, 8 + draw_w, radius * 2, radius * 2);
+                            let clip_rgn = CreateRoundRectRgn(x, 8, x + draw_w, 8 + draw_h, radius * 2, radius * 2);
                             let _ = SelectClipRgn(mem_dc, clip_rgn);
                             if let Some(thumb) = cache.get(&key) {
                                 let bmp_dc = CreateCompatibleDC(hdc);
                                 let old = SelectObject(bmp_dc, windows::Win32::Graphics::Gdi::HBITMAP(thumb.hbitmap as *mut _));
                                 let _ = SetStretchBltMode(mem_dc, COLORONCOLOR);
-                                let _ = StretchBlt(mem_dc, x, 8, draw_w, draw_w, bmp_dc, 0, 0, thumb.width, thumb.height, SRCCOPY);
+                                let _ = StretchBlt(mem_dc, x, 8, draw_w, draw_h, bmp_dc, 0, 0, thumb.width, thumb.height, SRCCOPY);
                                 SelectObject(bmp_dc, old);
                                 let _ = DeleteDC(bmp_dc);
                             } else {
                                 let ph = CreateSolidBrush(windows::Win32::Foundation::COLORREF(0x00303030));
-                                let r = RECT { left: x, top: 8, right: x + draw_w, bottom: 8 + draw_w };
+                                let r = RECT { left: x, top: 8, right: x + draw_w, bottom: 8 + draw_h };
                                 let _ = FillRect(mem_dc, &r, ph);
                                 let _ = DeleteObject(ph);
                             }
@@ -199,15 +202,15 @@ unsafe extern "system" fn panel_wnd_proc(
                                 } else {
                                     windows::Win32::Foundation::COLORREF(0x0000FF00)
                                 };
-                                let rgn = CreateRoundRectRgn(x, 8, x + draw_w, 8 + draw_w, radius * 2, radius * 2);
+                                let rgn = CreateRoundRectRgn(x, 8, x + draw_w, 8 + draw_h, radius * 2, radius * 2);
                                 let brush = CreateSolidBrush(color);
                                 let _ = FrameRgn(mem_dc, rgn, brush, 2, 2);
                                 let _ = DeleteObject(brush);
                                 let _ = DeleteObject(rgn);
                             }
-                            x += THUMB_SIZE + THUMB_MARGIN;
+                            x += THUMB_W + THUMB_MARGIN;
                         }
-                        let total_w = images.len() as i32 * (THUMB_SIZE + THUMB_MARGIN) + THUMB_MARGIN;
+                        let total_w = images.len() as i32 * (THUMB_W + THUMB_MARGIN) + THUMB_MARGIN;
                         if total_w > width {
                             let track_y = height - 4;
                             let track_h = 3;
@@ -249,12 +252,13 @@ unsafe extern "system" fn panel_wnd_proc(
                 if let Ok(images) = images_arc.lock() {
                     let mut tx = THUMB_MARGIN - scroll;
                     for (idx, img) in images.iter().enumerate() {
-                        let tw = (THUMB_SIZE as f32 * if Some(idx) == hover_idx { hover_scale } else { 1.0 }) as i32;
-                        if x >= tx && x < tx + tw && y >= 8 && y < 8 + tw {
+                        let tw = (THUMB_W as f32 * if Some(idx) == hover_idx { hover_scale } else { 1.0 }) as i32;
+                        let th = (THUMB_H as f32 * if Some(idx) == hover_idx { hover_scale } else { 1.0 }) as i32;
+                        if x >= tx && x < tx + tw && y >= 8 && y < 8 + th {
                             log_info!("Panel: clic en miniatura {} -> {:?}", idx, img.path);
                             pending_apply = Some(idx);
                         }
-                        tx += THUMB_SIZE + THUMB_MARGIN;
+                        tx += THUMB_W + THUMB_MARGIN;
                     }
                 }
             }
@@ -301,12 +305,13 @@ unsafe extern "system" fn panel_wnd_proc(
                 if let Ok(images) = images_arc.lock() {
                     let mut tx = THUMB_MARGIN - scroll;
                     for (idx, _img) in images.iter().enumerate() {
-                        let tw = (THUMB_SIZE as f32 * if Some(idx) == hover_idx { hover_scale } else { 1.0 }) as i32;
+                        let tw = (THUMB_W as f32 * if Some(idx) == hover_idx { hover_scale } else { 1.0 }) as i32;
+                        let _th = (THUMB_H as f32 * if Some(idx) == hover_idx { hover_scale } else { 1.0 }) as i32;
                         if x >= tx && x < tx + tw {
                             new_hover = Some(idx);
                             break;
                         }
-                        tx += THUMB_SIZE + THUMB_MARGIN;
+                        tx += THUMB_W + THUMB_MARGIN;
                     }
                 }
             }
@@ -342,7 +347,7 @@ unsafe extern "system" fn panel_wnd_proc(
                         }
                     }
                     let panel_w = PANEL_WIDTH.lock().map(|g| *g).unwrap_or(800);
-                    let max_scroll = (image_count as i32 * (THUMB_SIZE + THUMB_MARGIN) - panel_w).max(0);
+                    let max_scroll = (image_count as i32 * (THUMB_W + THUMB_MARGIN) - panel_w).max(0);
                     *g = (*g + delta).max(0).min(max_scroll);
                 }
                 if let Ok(mut g) = PANEL_LAST_MOUSE_X.lock() { *g = x; }
@@ -370,7 +375,7 @@ unsafe extern "system" fn panel_wnd_proc(
                     }
                 }
                 let panel_w = PANEL_WIDTH.lock().map(|g| *g).unwrap_or(800);
-                let max_scroll = (image_count as i32 * (THUMB_SIZE + THUMB_MARGIN) - panel_w).max(0);
+                let max_scroll = (image_count as i32 * (THUMB_W + THUMB_MARGIN) - panel_w).max(0);
                 *g = (*g + scroll_delta).max(0).min(max_scroll);
             }
             unsafe {
@@ -440,10 +445,10 @@ pub fn show_panel() {
         };
         let _ = GetMonitorInfoW(hmon, &mut mi);
 
-        let width = 800i32;
+        let width = (mi.rcWork.right - mi.rcWork.left).max(THUMB_W + THUMB_MARGIN * 2);
         // Altura ajustada al contenido (margen superior + miniatura), sin espacio muerto
-        let height = 8 + THUMB_SIZE;
-        let x = mi.rcMonitor.left + (mi.rcWork.right - mi.rcWork.left - width) / 2;
+        let height = 8 + THUMB_H;
+        let x = mi.rcWork.left;
         let start_y = mi.rcMonitor.top - height;
         let target_y = mi.rcMonitor.top;
 

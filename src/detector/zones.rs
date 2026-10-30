@@ -44,9 +44,7 @@ impl Default for ZoneConfig {
                 ZoneType::TopLeft,
                 ZoneType::Top,
                 ZoneType::TopRight,
-                ZoneType::Left,
-                ZoneType::Right,
-                // Zonas inferiores desactivadas por defecto para no colisionar con barra de tareas ni "Mostrar escritorio"
+                // Zonas laterales e inferiores desactivadas: solo activacion desde arriba
             ],
         }
     }

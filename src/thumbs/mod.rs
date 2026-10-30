@@ -96,7 +96,9 @@ pub fn request_thumbnail<P: AsRef<Path>>(hwnd: HWND, path: P, size_px: i32, cach
 
         if let Ok(shell_item) = SHCreateItemFromParsingName::<PCWSTR, Option<&windows::Win32::System::Com::IBindCtx>, IShellItem>(pcwstr, None) {
             if let Ok(factory) = shell_item.cast::<IShellItemImageFactory>() {
-                let size = windows::Win32::Foundation::SIZE { cx: size_px, cy: size_px };
+                let thumb_w = size_px;
+                let thumb_h = (size_px as f32 * 9.0 / 16.0).round() as i32;
+                let size = windows::Win32::Foundation::SIZE { cx: thumb_w, cy: thumb_h };
                 match factory.GetImage(size, SIIGBF_RESIZETOFIT) {
                     Ok(bmp) => {
                         let hbitmap = bmp.0 as isize;
@@ -112,8 +114,8 @@ pub fn request_thumbnail<P: AsRef<Path>>(hwnd: HWND, path: P, size_px: i32, cach
                             let thumb = Thumb {
                                 path_key: key.clone(),
                                 hbitmap,
-                                width: size_px,
-                                height: size_px,
+                                width: thumb_w,
+                                height: thumb_h,
                             };
                             cache.insert(thumb);
                             let _ = PostMessageW(HWND(hwnd_val as *mut _), WM_APP_THUMB_READY, WPARAM(0), LPARAM(0));
