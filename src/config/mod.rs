@@ -18,6 +18,74 @@ pub struct AppConfig {
     pub fit_mode: String, // "Fill" | "Fit" | "Stretch" | "Center" | "Tile"
     pub thumb_size: u32, // Tamaño en px de las miniaturas generadas (64..512, recomendado 128)
     pub zones: ZoneConfig,
+    #[serde(default)]
+    pub panel_side: PanelSide,
+    #[serde(default = "default_show_scrollbar")]
+    pub show_scrollbar: bool,
+    #[serde(default)]
+    pub hotkeys: HotkeyConfig,
+}
+
+fn default_show_scrollbar() -> bool { true }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PanelSide {
+    Top,
+    Left,
+    Right,
+}
+
+impl Default for PanelSide {
+    fn default() -> Self { Self::Top }
+}
+
+impl PanelSide {
+    pub fn active_zones(self) -> Vec<ZoneType> {
+        match self {
+            Self::Top => vec![ZoneType::TopLeft, ZoneType::Top, ZoneType::TopRight],
+            Self::Left => vec![ZoneType::TopLeft, ZoneType::Left, ZoneType::BottomLeft],
+            Self::Right => vec![ZoneType::TopRight, ZoneType::Right, ZoneType::BottomRight],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HotkeyConfig {
+    #[serde(default = "default_open_panel_hotkey")]
+    pub open_panel: HotkeyBinding,
+    #[serde(default = "default_previous_wallpaper_hotkey")]
+    pub previous_wallpaper: HotkeyBinding,
+    #[serde(default = "default_next_wallpaper_hotkey")]
+    pub next_wallpaper: HotkeyBinding,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HotkeyBinding {
+    pub modifiers: Vec<String>,
+    pub key: String,
+}
+
+fn default_open_panel_hotkey() -> HotkeyBinding {
+    HotkeyBinding { modifiers: vec!["CTRL".into(), "ALT".into()], key: "P".into() }
+}
+
+fn default_previous_wallpaper_hotkey() -> HotkeyBinding {
+    HotkeyBinding { modifiers: vec!["CTRL".into(), "ALT".into()], key: "LEFT".into() }
+}
+
+fn default_next_wallpaper_hotkey() -> HotkeyBinding {
+    HotkeyBinding { modifiers: vec!["CTRL".into(), "ALT".into()], key: "RIGHT".into() }
+}
+
+impl Default for HotkeyConfig {
+    fn default() -> Self {
+        Self {
+            open_panel: default_open_panel_hotkey(),
+            previous_wallpaper: default_previous_wallpaper_hotkey(),
+            next_wallpaper: default_next_wallpaper_hotkey(),
+        }
+    }
 }
 
 impl Default for AppConfig {
@@ -36,6 +104,9 @@ impl Default for AppConfig {
             fit_mode: "Fill".to_string(),
             thumb_size: 128,
             zones: ZoneConfig::default(),
+            panel_side: PanelSide::Top,
+            show_scrollbar: true,
+            hotkeys: HotkeyConfig::default(),
         }
     }
 }
@@ -62,8 +133,26 @@ impl AppConfig {
             let mut contents = String::new();
             if file.read_to_string(&mut contents).is_ok() {
                 if let Ok(mut config) = serde_json::from_str::<AppConfig>(&contents) {
-                    // Desactivar zonas laterales (izquierda/derecha) por diseño
-                    config.zones.active_zones.retain(|z| !matches!(z, ZoneType::Left | ZoneType::Right));
+                    let zones_changed = config.zones.active_zones != config.panel_side.active_zones();
+                    config.zones.active_zones = config.panel_side.active_zones();
+                    let has_all_hotkeys = serde_json::from_str::<serde_json::Value>(&contents)
+                        .ok()
+                        .and_then(|value| value.get("hotkeys").cloned())
+                        .map(|hotkeys| ["open_panel", "previous_wallpaper", "next_wallpaper"]
+                            .iter()
+                            .all(|name| hotkeys.get(name).is_some()))
+                        .unwrap_or(false);
+                    let has_panel_side = serde_json::from_str::<serde_json::Value>(&contents)
+                        .ok()
+                        .and_then(|value| value.get("panel_side").cloned())
+                        .is_some();
+                    let has_show_scrollbar = serde_json::from_str::<serde_json::Value>(&contents)
+                        .ok()
+                        .and_then(|value| value.get("show_scrollbar").cloned())
+                        .is_some();
+                    if !has_all_hotkeys || !has_panel_side || !has_show_scrollbar || zones_changed {
+                        let _ = config.save();
+                    }
                     log_info!("Configuración general cargada desde {:?}", path);
                     return config;
                 }

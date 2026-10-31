@@ -2,8 +2,10 @@ use crate::log_info;
 use crate::log_warn;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
+use std::os::windows::io::AsRawHandle;
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, ReadDirectoryChangesW, FILE_ACTION_ADDED, FILE_ACTION_MODIFIED, FILE_ACTION_REMOVED, FILE_ACTION_RENAMED_NEW_NAME, FILE_ACTION_RENAMED_OLD_NAME, FILE_FLAG_BACKUP_SEMANTICS, FILE_LIST_DIRECTORY, FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_INFORMATION, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
@@ -15,7 +17,6 @@ pub const WM_APP_WATCHER_CHANGED: u32 = WM_APP + 30;
 pub struct DirectoryWatcher {
     stop: Option<Arc<AtomicBool>>,
     thread: Option<thread::JoinHandle<()>>,
-    handle_slot: Option<Arc<Mutex<Option<isize>>>>,
     last_watched: Option<std::path::PathBuf>,
     last_subtree: bool,
 }
@@ -25,7 +26,6 @@ impl DirectoryWatcher {
         Self {
             stop: None,
             thread: None,
-            handle_slot: None,
             last_watched: None,
             last_subtree: false,
         }
@@ -46,9 +46,7 @@ impl DirectoryWatcher {
         self.last_subtree = watch_subtree;
 
         let stop = Arc::new(AtomicBool::new(false));
-        let slot = Arc::new(Mutex::new(None));
         let stop_clone = stop.clone();
-        let slot_clone = slot.clone();
         let hwnd_val = hwnd.0 as isize;
 
         let thread_handle = thread::spawn(move || {
@@ -74,10 +72,6 @@ impl DirectoryWatcher {
                         return;
                     }
                 };
-
-                if let Ok(mut g) = slot_clone.lock() {
-                    *g = Some(dir_handle.0 as isize);
-                }
 
                 log_info!("Vigilancia de directorio iniciada: {:?}", folder);
 
@@ -147,33 +141,26 @@ impl DirectoryWatcher {
                 }
 
                 // Limpieza
-                if let Ok(mut g) = slot_clone.lock() {
-                    if let Some(h) = g.take() {
-                        let _ = windows::Win32::Foundation::CloseHandle(windows::Win32::Foundation::HANDLE(h as *mut _));
-                    }
-                }
+                let _ = windows::Win32::Foundation::CloseHandle(dir_handle);
             }
         });
 
         self.stop = Some(stop);
         self.thread = Some(thread_handle);
-        self.handle_slot = Some(slot);
     }
 
     fn stop_previous(&mut self) {
         if let Some(flag) = self.stop.take() {
             flag.store(true, Ordering::Relaxed);
         }
-        if let Some(slot) = self.handle_slot.take() {
-            if let Ok(mut g) = slot.lock() {
-                if let Some(h) = g.take() {
-                    unsafe {
-                        let _ = windows::Win32::Foundation::CloseHandle(windows::Win32::Foundation::HANDLE(h as *mut _));
-                    }
-                }
-            }
-        }
         if let Some(t) = self.thread.take() {
+            while !t.is_finished() {
+                unsafe {
+                    let thread_handle = windows::Win32::Foundation::HANDLE(t.as_raw_handle() as *mut _);
+                    let _ = windows::Win32::System::IO::CancelSynchronousIo(thread_handle);
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
             let _ = t.join();
         }
     }

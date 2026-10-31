@@ -55,13 +55,16 @@ pub fn set_main_hwnd(hwnd: windows::Win32::Foundation::HWND) {
 }
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_WIN,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
     GetWindowLongPtrW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW,
     SetWindowLongPtrW, TranslateMessage, UnregisterClassW, GWLP_USERDATA, MSG, WNDCLASSW,
     CS_HREDRAW, CS_VREDRAW, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY, WM_DISPLAYCHANGE,
     WM_ENDSESSION, WM_INPUT, WM_LBUTTONUP, WM_POWERBROADCAST, WM_QUERYENDSESSION,
-    WM_RBUTTONUP, WM_TIMER, WS_OVERLAPPED,
+    WM_RBUTTONUP, WM_TIMER, WM_HOTKEY, WS_OVERLAPPED,
 };
 
 const WINDOW_CLASS_NAME: &str = "SWEPR_MainWindowClass";
@@ -75,6 +78,72 @@ const PBT_APMRESUMESUSPEND: u32 = 0x0007;
 use std::sync::{Arc, Mutex};
 use crate::scanner::ScannedImage;
 const WATCHER_DEBOUNCE_TIMER_ID: usize = 9001;
+const HOTKEY_PANEL_ID: i32 = 1;
+const HOTKEY_PREVIOUS_ID: i32 = 2;
+const HOTKEY_NEXT_ID: i32 = 3;
+
+fn virtual_key_code(name: &str) -> Option<u32> {
+    let normalized = name.trim().to_ascii_uppercase();
+    if normalized.len() == 1 {
+        let byte = normalized.as_bytes()[0];
+        if byte.is_ascii_alphanumeric() {
+            return Some(byte as u32);
+        }
+    }
+    match normalized.as_str() {
+        "LEFT" => Some(0x25),
+        "UP" => Some(0x26),
+        "RIGHT" => Some(0x27),
+        "DOWN" => Some(0x28),
+        "SPACE" => Some(0x20),
+        "ENTER" => Some(0x0D),
+        "TAB" => Some(0x09),
+        "ESC" | "ESCAPE" => Some(0x1B),
+        "BACKSPACE" => Some(0x08),
+        "HOME" => Some(0x24),
+        "END" => Some(0x23),
+        "PAGEUP" => Some(0x21),
+        "PAGEDOWN" => Some(0x22),
+        "INSERT" => Some(0x2D),
+        "DELETE" => Some(0x2E),
+        value if value.starts_with('F') => value[1..].parse::<u32>().ok()
+            .filter(|number| (1..=24).contains(number))
+            .map(|number| 0x70 + number - 1),
+        _ => None,
+    }
+}
+
+fn register_configured_hotkey(
+    hwnd: HWND,
+    id: i32,
+    description: &str,
+    binding: &crate::config::HotkeyBinding,
+) {
+    let Some(key) = virtual_key_code(&binding.key) else {
+        log_warn!("Atajo {description} omitido: tecla desconocida {:?}.", binding.key);
+        return;
+    };
+
+    let mut modifiers = HOT_KEY_MODIFIERS(0);
+    for modifier in &binding.modifiers {
+        modifiers |= match modifier.trim().to_ascii_uppercase().as_str() {
+            "CTRL" | "CONTROL" => MOD_CONTROL,
+            "ALT" => MOD_ALT,
+            "SHIFT" => MOD_SHIFT,
+            "WIN" | "WINDOWS" => MOD_WIN,
+            other => {
+                log_warn!("Atajo {description} omitido: modificador desconocido {:?}.", other);
+                return;
+            }
+        };
+    }
+
+    if let Err(error) = unsafe { RegisterHotKey(hwnd, id, modifiers, key) } {
+        log_warn!("No se pudo registrar el atajo {description} ({:?}+{}): {error}", binding.modifiers, binding.key);
+    } else {
+        log_info!("Atajo registrado: {description} ({:?}+{})", binding.modifiers, binding.key);
+    }
+}
 
 pub struct AppState {
     pub config: Arc<Mutex<AppConfig>>,
@@ -121,6 +190,31 @@ unsafe extern "system" fn wnd_proc(
         }
 
         match msg {
+            WM_HOTKEY => {
+                match wparam.0 as i32 {
+                    HOTKEY_PANEL_ID => panel::show_panel_from_hotkey(),
+                    HOTKEY_PREVIOUS_ID | HOTKEY_NEXT_ID => {
+                        let images = state.scanned_images.lock().ok().map(|items| items.clone()).unwrap_or_default();
+                        if !images.is_empty() {
+                            let current = state.wallpaper_manager.get_current_wallpaper().ok();
+                            let current_index = current.as_ref().and_then(|path| {
+                                images.iter().position(|image| image.path.to_string_lossy().eq_ignore_ascii_case(&path.to_string_lossy()))
+                            });
+                            let index = match (wparam.0 as i32, current_index) {
+                                (HOTKEY_PREVIOUS_ID, Some(0)) => images.len() - 1,
+                                (HOTKEY_PREVIOUS_ID, Some(index)) => index - 1,
+                                (HOTKEY_PREVIOUS_ID, None) => images.len() - 1,
+                                (HOTKEY_NEXT_ID, Some(index)) => (index + 1) % images.len(),
+                                (HOTKEY_NEXT_ID, None) => 0,
+                                _ => 0,
+                            };
+                            request_apply_wallpaper(&images[index].path);
+                        }
+                    }
+                    _ => {}
+                }
+                return LRESULT(0);
+            }
             WM_APP_TRAY_NOTIFICATION => {
                 let mouse_msg = (lparam.0 & 0xFFFF) as u32;
                 if mouse_msg == WM_RBUTTONUP || mouse_msg == WM_CONTEXTMENU {
@@ -296,16 +390,21 @@ unsafe extern "system" fn wnd_proc(
                 if let Ok(mut g) = state.scanned_images.lock() {
                     g.clear();
                 }
-                let (by_date, wallpaper_dir, scan_subfolders, detection_enabled, zones) = {
+                let (by_date, wallpaper_dir, scan_subfolders, detection_enabled, panel_side, show_scrollbar, mut zones) = {
                     let config = state.config.lock().unwrap();
                     (
                         config.sort_by.eq_ignore_ascii_case("date"),
                         config.wallpaper_dir.clone(),
                         config.scan_subfolders,
                         config.detection_enabled,
+                        config.panel_side,
+                        config.show_scrollbar,
                         config.zones.clone(),
                     )
                 };
+                zones.active_zones = panel_side.active_zones();
+                panel::set_panel_side(panel_side);
+                panel::set_scrollbar_visible(show_scrollbar);
                 state.zone_detector.update_config(zones);
                 state.scanner.scan_folder(
                     hwnd,
@@ -401,6 +500,9 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         WM_DESTROY => {
+            let _ = UnregisterHotKey(hwnd, HOTKEY_PANEL_ID);
+            let _ = UnregisterHotKey(hwnd, HOTKEY_PREVIOUS_ID);
+            let _ = UnregisterHotKey(hwnd, HOTKEY_NEXT_ID);
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
             PostQuitMessage(0);
             LRESULT(0)
@@ -421,6 +523,8 @@ impl App {
     /// Inicializa la configuración, la ventana oculta, el icono de bandeja y los detectores.
     pub fn new() -> Result<Self, String> {
         let config = AppConfig::load_or_default();
+        panel::set_panel_side(config.panel_side);
+        panel::set_scrollbar_visible(config.show_scrollbar);
 
         if let Err(e) = crate::config::autostart::set_autostart(config.autostart) {
             crate::log_warn!("Fallo al sincronizar autoarranque inicial: {e}");
@@ -463,6 +567,10 @@ impl App {
 
             crate::app::set_main_hwnd(hwnd);
             log_info!("Ventana principal creada con éxito. HWND: {:?}", hwnd);
+
+            register_configured_hotkey(hwnd, HOTKEY_PANEL_ID, "open_panel", &config.hotkeys.open_panel);
+            register_configured_hotkey(hwnd, HOTKEY_PREVIOUS_ID, "previous_wallpaper", &config.hotkeys.previous_wallpaper);
+            register_configured_hotkey(hwnd, HOTKEY_NEXT_ID, "next_wallpaper", &config.hotkeys.next_wallpaper);
 
             // Registro del mensaje TaskbarCreated para reaccionar al reinicio de explorer.exe
             let taskbar_name = to_wide_chars("TaskbarCreated");

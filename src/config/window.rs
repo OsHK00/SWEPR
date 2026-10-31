@@ -1,4 +1,4 @@
-use crate::config::AppConfig;
+use crate::config::{AppConfig, PanelSide};
 use crate::log_info;
 use crate::winutil::{as_pcwstr, to_wide_chars};
 use std::sync::{Arc, Mutex};
@@ -24,6 +24,8 @@ const IDC_THUMB_CHK_64: i32 = 1010;
 const IDC_THUMB_CHK_128: i32 = 1011;
 const IDC_THUMB_CHK_256: i32 = 1012;
 const IDC_THUMB_CHK_512: i32 = 1013;
+const IDC_PANEL_SIDE_COMBO: i32 = 1014;
+const IDC_SCROLLBAR_CHK: i32 = 1015;
 
 static CONFIG_HWND: Mutex<Option<isize>> = Mutex::new(None);
 static CONFIG_STATE: Mutex<Option<Arc<Mutex<AppConfig>>>> = Mutex::new(None);
@@ -133,6 +135,47 @@ unsafe extern "system" fn config_wnd_proc(
             );
             y += 40;
 
+            let _ = CreateWindowExW(
+                windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(0),
+                as_pcwstr(&to_wide_chars("STATIC")),
+                as_pcwstr(&to_wide_chars("Posición del panel de miniaturas:")),
+                windows::Win32::UI::WindowsAndMessaging::WS_CHILD | windows::Win32::UI::WindowsAndMessaging::WS_VISIBLE,
+                x, y, w, 16, hwnd, windows::Win32::UI::WindowsAndMessaging::HMENU(std::ptr::null_mut()), None, None,
+            );
+            y += 20;
+            let combo = CreateWindowExW(
+                windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(0),
+                as_pcwstr(&to_wide_chars("COMBOBOX")),
+                as_pcwstr(&to_wide_chars("")),
+                windows::Win32::UI::WindowsAndMessaging::WS_CHILD
+                    | windows::Win32::UI::WindowsAndMessaging::WS_VISIBLE
+                    | windows::Win32::UI::WindowsAndMessaging::WS_VSCROLL
+                    | windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(3),
+                x, y, 220, 100, hwnd, hmenu(IDC_PANEL_SIDE_COMBO), None, None,
+            );
+            if let Ok(combo) = combo {
+                for item in ["Arriba", "Izquierda", "Derecha"] {
+                    let wide = to_wide_chars(item);
+                    let _ = SendMessageW(
+                        combo,
+                        windows::Win32::UI::WindowsAndMessaging::CB_ADDSTRING,
+                        WPARAM(0),
+                        LPARAM(wide.as_ptr() as isize),
+                    );
+                }
+            }
+            y += 35;
+            let _ = CreateWindowExW(
+                windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(0),
+                as_pcwstr(&to_wide_chars("BUTTON")),
+                as_pcwstr(&to_wide_chars("Mostrar barra de desplazamiento")),
+                windows::Win32::UI::WindowsAndMessaging::WS_CHILD
+                    | windows::Win32::UI::WindowsAndMessaging::WS_VISIBLE
+                    | windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(3),
+                x, y, w, h, hwnd, hmenu(IDC_SCROLLBAR_CHK), None, None,
+            );
+            y += 35;
+
             // Calidad / Detalle de miniatura (grupo de radios)
             let _ = CreateWindowExW(
                 windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(0),
@@ -227,6 +270,28 @@ unsafe extern "system" fn config_wnd_proc(
                         if !chk.is_invalid() {
                             use windows::Win32::UI::WindowsAndMessaging::BM_SETCHECK;
                             let check = if config.autostart { 1usize } else { 0usize };
+                            let _ = SendMessageW(chk, BM_SETCHECK, WPARAM(check), LPARAM(0));
+                        }
+                    }
+                    if let Ok(combo) = GetDlgItem(hwnd, IDC_PANEL_SIDE_COMBO) {
+                        if !combo.is_invalid() {
+                            let selection = match config.panel_side {
+                                PanelSide::Top => 0,
+                                PanelSide::Left => 1,
+                                PanelSide::Right => 2,
+                            };
+                            let _ = SendMessageW(
+                                combo,
+                                windows::Win32::UI::WindowsAndMessaging::CB_SETCURSEL,
+                                WPARAM(selection),
+                                LPARAM(0),
+                            );
+                        }
+                    }
+                    if let Ok(chk) = GetDlgItem(hwnd, IDC_SCROLLBAR_CHK) {
+                        if !chk.is_invalid() {
+                            use windows::Win32::UI::WindowsAndMessaging::BM_SETCHECK;
+                            let check = if config.show_scrollbar { 1usize } else { 0usize };
                             let _ = SendMessageW(chk, BM_SETCHECK, WPARAM(check), LPARAM(0));
                         }
                     }
@@ -371,6 +436,24 @@ unsafe extern "system" fn config_wnd_proc(
                             if let Some(size) = thumb_size {
                                 config.thumb_size = size;
                             }
+                            if let Ok(combo) = GetDlgItem(hwnd, IDC_PANEL_SIDE_COMBO) {
+                                let selected = SendMessageW(
+                                    combo,
+                                    windows::Win32::UI::WindowsAndMessaging::CB_GETCURSEL,
+                                    WPARAM(0),
+                                    LPARAM(0),
+                                ).0 as usize;
+                                config.panel_side = match selected {
+                                    1 => PanelSide::Left,
+                                    2 => PanelSide::Right,
+                                    _ => PanelSide::Top,
+                                };
+                                config.zones.active_zones = config.panel_side.active_zones();
+                            }
+                            if let Ok(chk) = GetDlgItem(hwnd, IDC_SCROLLBAR_CHK) {
+                                use windows::Win32::UI::WindowsAndMessaging::BM_GETCHECK;
+                                config.show_scrollbar = SendMessageW(chk, BM_GETCHECK, WPARAM(0), LPARAM(0)).0 == 1;
+                            }
                             let autostart_enabled = config.autostart;
                             let _ = config.save();
                             if let Err(e) = crate::config::autostart::set_autostart(autostart_enabled) {
@@ -460,7 +543,7 @@ pub fn show_config_window(config: Arc<Mutex<AppConfig>>) {
             as_pcwstr(&class_name_wide),
             as_pcwstr(&to_wide_chars("SWEPR - Configuración")),
             WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_VISIBLE,
-            100, 100, 540, 440,
+            100, 100, 540, 540,
             None, None, hinstance, None,
         ) {
             Ok(h) => h,
