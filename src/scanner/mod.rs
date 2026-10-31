@@ -1,6 +1,8 @@
 use crate::log_info;
 use crate::log_warn;
 use std::path::{Path, PathBuf};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
@@ -12,13 +14,16 @@ pub const WM_APP_SCAN_COMPLETE: u32 = WM_APP + 10;
 pub struct ScannedImage {
     pub path: PathBuf,
     pub file_name: String,
+    pub is_new: bool,
 }
 
-pub struct Scanner;
+pub struct Scanner {
+    has_scanned: AtomicBool,
+}
 
 impl Scanner {
     pub fn new() -> Self {
-        Self
+        Self { has_scanned: AtomicBool::new(false) }
     }
 
     /// Escanea la carpeta en un hilo aparte. Guarda el resultado en `results` y notifica a `hwnd` con WM_APP_SCAN_COMPLETE.
@@ -32,6 +37,10 @@ impl Scanner {
     ) {
         let folder = folder.as_ref().to_path_buf();
         let hwnd_val = hwnd.0 as isize;
+        let is_initial_scan = !self.has_scanned.swap(true, Ordering::Relaxed);
+        let previous_new: HashMap<PathBuf, bool> = results.lock().map(|images| {
+            images.iter().map(|image| (image.path.clone(), image.is_new)).collect()
+        }).unwrap_or_default();
 
         thread::spawn(move || {
             let start = std::time::Instant::now();
@@ -66,6 +75,7 @@ impl Scanner {
                                     images.push(ScannedImage {
                                         path: path.clone(),
                                         file_name,
+                                        is_new: false,
                                     });
                                 }
                             }
@@ -91,6 +101,15 @@ impl Scanner {
             } else {
                 images.sort_by(|a, b| a.file_name.to_lowercase().cmp(&b.file_name.to_lowercase()));
             }
+
+            for image in &mut images {
+                image.is_new = if is_initial_scan {
+                    false
+                } else {
+                    previous_new.get(&image.path).copied().unwrap_or(true)
+                };
+            }
+            images.sort_by(|a, b| b.is_new.cmp(&a.is_new));
 
             let count = images.len();
             let elapsed = start.elapsed().as_millis();

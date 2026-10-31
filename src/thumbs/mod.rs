@@ -114,19 +114,28 @@ pub fn request_thumbnail<P: AsRef<Path>>(hwnd: HWND, path: P, size_px: i32, cach
                     Ok(bmp) => {
                         let hbitmap = bmp.0 as isize;
                         if hbitmap != 0 {
+                            let mut bitmap = windows::Win32::Graphics::Gdi::BITMAP::default();
+                            let bitmap_size = std::mem::size_of::<windows::Win32::Graphics::Gdi::BITMAP>() as i32;
+                            let actual_size = windows::Win32::Graphics::Gdi::GetObjectW(
+                                windows::Win32::Graphics::Gdi::HGDIOBJ(bmp.0),
+                                bitmap_size,
+                                Some(&mut bitmap as *mut _ as *mut std::ffi::c_void),
+                            );
+                            let actual_w = if actual_size > 0 { bitmap.bmWidth } else { thumb_w };
+                            let actual_h = if actual_size > 0 { bitmap.bmHeight } else { thumb_h };
                             let elapsed = start.elapsed().as_millis();
                             log_info!(
                                 "Miniatura generada para {:?} en {} ms ({}x{})",
                                 path_buf.file_name().unwrap_or_default(),
                                 elapsed,
-                                thumb_w,
-                                thumb_h
+                                actual_w,
+                                actual_h
                             );
                             let thumb = Thumb {
                                 path_key: key.clone(),
                                 hbitmap,
-                                width: thumb_w,
-                                height: thumb_h,
+                                width: actual_w,
+                                height: actual_h,
                             };
                             cache.insert(thumb);
                             let _ = PostMessageW(HWND(hwnd_val as *mut _), WM_APP_THUMB_READY, WPARAM(0), LPARAM(0));

@@ -20,6 +20,8 @@ pub const IDM_OPEN_FOLDER: usize = 1004;
 pub const IDM_SETTINGS: usize = 1005;
 pub const IDM_EXIT: usize = 1008;
 
+fn tr(key: &str) -> Vec<u16> { to_wide_chars(&crate::i18n::t(key)) }
+
 /// Gestor del icono de bandeja del sistema (System Tray) y su menú contextual.
 pub struct TrayIcon {
     hwnd: HWND,
@@ -51,7 +53,7 @@ impl TrayIcon {
             nid.hIcon = hicon;
         }
 
-        let tip_chars = to_wide_chars("SWEPR - Selector de Fondos");
+        let tip_chars = tr("SWEPR - Wallpaper Selector");
         let copy_len = tip_chars.len().min(nid.szTip.len());
         nid.szTip[..copy_len].copy_from_slice(&tip_chars[..copy_len]);
 
@@ -116,11 +118,11 @@ impl TrayIcon {
                 }
             };
 
-            let title_detect = to_wide_chars("Detección activada");
-            let title_refresh = to_wide_chars("Actualizar galería");
-            let title_folder = to_wide_chars("Abrir carpeta");
-            let title_config = to_wide_chars("Configuración...");
-            let title_exit = to_wide_chars("Salir");
+            let title_detect = tr("Detection enabled");
+            let title_refresh = tr("Refresh gallery");
+            let title_folder = tr("Open folder");
+            let title_config = tr("Settings...");
+            let title_exit = tr("Exit");
 
             let det_flags = if detection_enabled {
                 MF_STRING | MF_CHECKED

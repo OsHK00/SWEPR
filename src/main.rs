@@ -3,6 +3,7 @@
 mod app;
 mod config;
 mod detector;
+mod i18n;
 mod log;
 mod panel;
 mod scanner;

@@ -74,6 +74,25 @@ static PANEL_THUMB_TARGETS: Mutex<Vec<f32>> = Mutex::new(Vec::new());
 static PANEL_THUMB_ANIM: Mutex<bool> = Mutex::new(false);
 static PANEL_CURRENT_WALLPAPER: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
 
+fn thumbnail_content_extent(count: usize, vertical: bool) -> i32 {
+    if count == 0 { return 0; }
+    let item_size = if vertical { THUMB_H } else { THUMB_W };
+    count as i32 * item_size + (count as i32 - 1) * THUMB_MARGIN + THUMB_MARGIN * 2
+}
+
+fn thumbnail_origin(index: usize, count: usize, viewport: i32, scroll: i32, vertical: bool) -> (i32, i32) {
+    if count == 0 { return (THUMB_MARGIN, THUMB_MARGIN); }
+    let item_size = if vertical { THUMB_H } else { THUMB_W };
+    let item_extent = item_size + THUMB_MARGIN;
+    let content_size = count as i32 * item_size + (count as i32 - 1) * THUMB_MARGIN;
+    let origin = if thumbnail_content_extent(count, vertical) <= viewport {
+        (viewport - content_size) / 2
+    } else {
+        THUMB_MARGIN
+    } + index as i32 * item_extent - scroll;
+    if vertical { (THUMB_MARGIN, origin) } else { (origin, THUMB_MARGIN) }
+}
+
 /// Actualiza el objetivo de animación hover/foco para las miniaturas e inicia el temporizador de interpolación.
 fn set_hover_target(hwnd: HWND, new_hover: Option<usize>) {
     let prev_hover = if let Ok(g) = PANEL_HOVER_INDEX.lock() { *g } else { None };
@@ -199,7 +218,6 @@ unsafe extern "system" fn panel_wnd_proc(
                 let mem_dc = CreateCompatibleDC(hdc);
                 let mem_bmp = CreateCompatibleBitmap(hdc, width, height);
                 let old_bmp = SelectObject(mem_dc, mem_bmp);
-
                 let bg = CreateSolidBrush(windows::Win32::Foundation::COLORREF(0x00181818));
                 let _ = FillRect(mem_dc, &rect, bg);
                 let _ = DeleteObject(bg);
@@ -224,8 +242,7 @@ unsafe extern "system" fn panel_wnd_proc(
                             let th = (THUMB_H as f32 * scale) as i32;
                             let draw_w = tw.max(1);
                             let draw_h = th.max(1);
-                            let base_x = if vertical { THUMB_MARGIN } else { THUMB_MARGIN - scroll + idx as i32 * (THUMB_W + THUMB_MARGIN) };
-                            let base_y = if vertical { THUMB_MARGIN - scroll + idx as i32 * (THUMB_H + THUMB_MARGIN) } else { THUMB_MARGIN };
+                            let (base_x, base_y) = thumbnail_origin(idx, images.len(), if vertical { height } else { width }, scroll, vertical);
                             let mut x = base_x;
                             if let Some(hi) = hover {
                                 if idx < hi { x -= half_g; }
@@ -241,7 +258,14 @@ unsafe extern "system" fn panel_wnd_proc(
                                 let bmp_dc = CreateCompatibleDC(hdc);
                                 let old = SelectObject(bmp_dc, windows::Win32::Graphics::Gdi::HBITMAP(thumb.hbitmap as *mut _));
                                 let _ = SetStretchBltMode(mem_dc, COLORONCOLOR);
-                                let _ = StretchBlt(mem_dc, draw_x, draw_y, draw_w, draw_h, bmp_dc, 0, 0, thumb.width, thumb.height, SRCCOPY);
+                                let (src_x, src_y, src_w, src_h) = if thumb.width * draw_h > thumb.height * draw_w {
+                                    let crop_w = (thumb.height * draw_w / draw_h).max(1);
+                                    ((thumb.width - crop_w) / 2, 0, crop_w, thumb.height)
+                                } else {
+                                    let crop_h = (thumb.width * draw_h / draw_w).max(1);
+                                    (0, (thumb.height - crop_h) / 2, thumb.width, crop_h)
+                                };
+                                let _ = StretchBlt(mem_dc, draw_x, draw_y, draw_w, draw_h, bmp_dc, src_x, src_y, src_w, src_h, SRCCOPY);
                                 SelectObject(bmp_dc, old);
                                 let _ = DeleteDC(bmp_dc);
                             } else {
@@ -253,7 +277,7 @@ unsafe extern "system" fn panel_wnd_proc(
                             let _ = SelectClipRgn(mem_dc, windows::Win32::Graphics::Gdi::HRGN(std::ptr::null_mut()));
                             let _ = DeleteObject(clip_rgn);
                             let is_current = current_wp.as_ref().map(|p| p == &img.path).unwrap_or(false);
-                            if is_current || hover == Some(idx) {
+                            if is_current || img.is_new || hover == Some(idx) {
                                 let color = if hover == Some(idx) {
                                     windows::Win32::Foundation::COLORREF(0x00FFFFFF)
                                 } else {
@@ -273,11 +297,7 @@ unsafe extern "system" fn panel_wnd_proc(
                                 let _ = DeleteObject(rgn);
                             }
                         }
-                        let total_main = if vertical {
-                            images.len() as i32 * (THUMB_H + THUMB_MARGIN) + THUMB_MARGIN + (THUMB_H / 10)
-                        } else {
-                            images.len() as i32 * (THUMB_W + THUMB_MARGIN) + THUMB_MARGIN + (THUMB_W / 10)
-                        };
+                        let total_main = thumbnail_content_extent(images.len(), vertical);
                         let viewport = if vertical { height } else { width };
                         let show_scrollbar = PANEL_SHOW_SCROLLBAR.lock().map(|show| *show).unwrap_or(true);
                         if show_scrollbar && total_main > viewport {
@@ -347,8 +367,7 @@ unsafe extern "system" fn panel_wnd_proc(
                     if let Ok(images) = images_arc.lock() {
                         let half_g = 0;
                         for (idx, img) in images.iter().enumerate() {
-                            let mut tx = if vertical { THUMB_MARGIN } else { THUMB_MARGIN - scroll + idx as i32 * (THUMB_W + THUMB_MARGIN) };
-                            let ty = if vertical { THUMB_MARGIN - scroll + idx as i32 * (THUMB_H + THUMB_MARGIN) } else { THUMB_MARGIN };
+                            let (mut tx, ty) = thumbnail_origin(idx, images.len(), if vertical { PANEL_HEIGHT.lock().map(|g| *g).unwrap_or(600) } else { PANEL_WIDTH.lock().map(|g| *g).unwrap_or(800) }, scroll, vertical);
                             if let Some(hi) = hover_idx {
                                 if idx < hi { tx -= half_g; }
                                 else if idx > hi { tx += half_g; }
@@ -381,8 +400,7 @@ unsafe extern "system" fn panel_wnd_proc(
                     let half_g = 0;
                     for (idx, _img) in images.iter().enumerate() {
                         let _tw = (THUMB_W as f32 * if Some(idx) == hover_idx { hover_scale } else { 1.0 }) as i32;
-                        let mut tx = if vertical { THUMB_MARGIN } else { THUMB_MARGIN - scroll + idx as i32 * (THUMB_W + THUMB_MARGIN) };
-                        let ty = if vertical { THUMB_MARGIN - scroll + idx as i32 * (THUMB_H + THUMB_MARGIN) } else { THUMB_MARGIN };
+                        let (mut tx, ty) = thumbnail_origin(idx, images.len(), if vertical { PANEL_HEIGHT.lock().map(|g| *g).unwrap_or(600) } else { PANEL_WIDTH.lock().map(|g| *g).unwrap_or(800) }, scroll, vertical);
                         if let Some(hi) = hover_idx {
                             if idx < hi { tx -= half_g; }
                             else if idx > hi { tx += half_g; }
@@ -419,9 +437,7 @@ unsafe extern "system" fn panel_wnd_proc(
                     } else {
                         PANEL_WIDTH.lock().map(|g| *g).unwrap_or(800)
                     };
-                    let item_extent = if vertical { THUMB_H + THUMB_MARGIN } else { THUMB_W + THUMB_MARGIN };
-                    let tail = if vertical { THUMB_H / 10 } else { THUMB_W / 10 };
-                    let max_scroll = (image_count as i32 * item_extent + tail - viewport).max(0);
+                    let max_scroll = (thumbnail_content_extent(image_count, vertical) - viewport).max(0);
                     *g = (*g + delta).max(0).min(max_scroll);
                 }
                 if let Ok(mut g) = PANEL_LAST_MOUSE_X.lock() { *g = axis; }
@@ -454,9 +470,7 @@ unsafe extern "system" fn panel_wnd_proc(
                 } else {
                     PANEL_WIDTH.lock().map(|g| *g).unwrap_or(800)
                 };
-                let item_extent = if vertical { THUMB_H + THUMB_MARGIN } else { THUMB_W + THUMB_MARGIN };
-                let tail = if vertical { THUMB_H / 10 } else { THUMB_W / 10 };
-                let max_scroll = (image_count as i32 * item_extent + tail - viewport).max(0);
+                let max_scroll = (thumbnail_content_extent(image_count, vertical) - viewport).max(0);
                 *g = (*g + scroll_delta).max(0).min(max_scroll);
             }
             unsafe {
@@ -655,8 +669,8 @@ fn show_panel_with_close_on_mouse_leave(close_on_mouse_leave: bool) {
         };
         let start_y = if side == PanelSide::Top { mi.rcMonitor.top - height } else { target_y };
         let viewport = if vertical { height } else { width };
-        let item_extent = if vertical { THUMB_H + THUMB_MARGIN } else { THUMB_W + THUMB_MARGIN };
         let item_size = if vertical { THUMB_H } else { THUMB_W };
+        let item_extent = item_size + THUMB_MARGIN;
 
         // Calcular fondo seleccionado actual y posición de scroll centrada
         let (selected_idx, initial_scroll, image_count) = {
@@ -672,8 +686,7 @@ fn show_panel_with_close_on_mouse_leave(close_on_mouse_leave: bool) {
                     };
                     let item_x = idx as i32 * item_extent + THUMB_MARGIN;
                     let center_scroll = (item_x + item_size / 2) - (viewport / 2);
-                    let tail = item_size / 10;
-                    let max_scroll = (count as i32 * item_extent + tail - viewport).max(0);
+                    let max_scroll = (thumbnail_content_extent(count, vertical) - viewport).max(0);
                     let scroll = center_scroll.clamp(0, max_scroll);
                     (idx, scroll, count)
                 } else {

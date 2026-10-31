@@ -347,6 +347,11 @@ unsafe extern "system" fn wnd_proc(
                     match state.wallpaper_manager.set_wallpaper(&path, None, style) {
                         Ok(_) => {
                             log_info!("Wallpaper aplicado correctamente.");
+                            if let Ok(mut images) = state.scanned_images.lock() {
+                                if let Some(image) = images.iter_mut().find(|image| image.path == path) {
+                                    image.is_new = false;
+                                }
+                            }
                             crate::panel::set_current_wallpaper(&path);
                         }
                         Err(e) => log_error!("Error al aplicar wallpaper: {e}"),
@@ -386,11 +391,7 @@ unsafe extern "system" fn wnd_proc(
                 log_info!("Configuración cambiada, limpiando caché y reescaneando...");
                 // Limpiar caché de miniaturas
                 state.thumb_cache.clear();
-                // Limpiar imágenes escaneadas
-                if let Ok(mut g) = state.scanned_images.lock() {
-                    g.clear();
-                }
-                let (by_date, wallpaper_dir, scan_subfolders, detection_enabled, panel_side, show_scrollbar, mut zones) = {
+                let (by_date, wallpaper_dir, scan_subfolders, detection_enabled, panel_side, show_scrollbar, language, mut zones) = {
                     let config = state.config.lock().unwrap();
                     (
                         config.sort_by.eq_ignore_ascii_case("date"),
@@ -399,10 +400,12 @@ unsafe extern "system" fn wnd_proc(
                         config.detection_enabled,
                         config.panel_side,
                         config.show_scrollbar,
+                        config.language.clone(),
                         config.zones.clone(),
                     )
                 };
                 zones.active_zones = panel_side.active_zones();
+                crate::i18n::set_language(language);
                 panel::set_panel_side(panel_side);
                 panel::set_scrollbar_visible(show_scrollbar);
                 state.zone_detector.update_config(zones);
@@ -523,6 +526,7 @@ impl App {
     /// Inicializa la configuración, la ventana oculta, el icono de bandeja y los detectores.
     pub fn new() -> Result<Self, String> {
         let config = AppConfig::load_or_default();
+        crate::i18n::set_language(config.language.clone());
         panel::set_panel_side(config.panel_side);
         panel::set_scrollbar_visible(config.show_scrollbar);
 

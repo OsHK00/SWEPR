@@ -22,11 +22,14 @@ pub struct AppConfig {
     pub panel_side: PanelSide,
     #[serde(default = "default_show_scrollbar")]
     pub show_scrollbar: bool,
+    #[serde(default = "default_language")]
+    pub language: String,
     #[serde(default)]
     pub hotkeys: HotkeyConfig,
 }
 
 fn default_show_scrollbar() -> bool { true }
+fn default_language() -> String { "auto".to_string() }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -106,6 +109,7 @@ impl Default for AppConfig {
             zones: ZoneConfig::default(),
             panel_side: PanelSide::Top,
             show_scrollbar: true,
+            language: default_language(),
             hotkeys: HotkeyConfig::default(),
         }
     }
@@ -150,7 +154,15 @@ impl AppConfig {
                         .ok()
                         .and_then(|value| value.get("show_scrollbar").cloned())
                         .is_some();
-                    if !has_all_hotkeys || !has_panel_side || !has_show_scrollbar || zones_changed {
+                    let has_language = serde_json::from_str::<serde_json::Value>(&contents)
+                        .ok()
+                        .and_then(|value| value.get("language").cloned())
+                        .is_some();
+                    let has_legacy_acrylic = serde_json::from_str::<serde_json::Value>(&contents)
+                        .ok()
+                        .map(|value| value.get("acrylic_enabled").is_some() || value.get("acrylic_opacity").is_some())
+                        .unwrap_or(false);
+                    if !has_all_hotkeys || !has_panel_side || !has_show_scrollbar || !has_language || has_legacy_acrylic || zones_changed {
                         let _ = config.save();
                     }
                     log_info!("Configuración general cargada desde {:?}", path);
