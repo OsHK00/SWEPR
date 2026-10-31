@@ -711,6 +711,7 @@ fn show_panel_with_close_on_mouse_leave(close_on_mouse_leave: bool) {
                 style: CS_HREDRAW | CS_VREDRAW,
                 lpfnWndProc: Some(panel_wnd_proc),
                 hInstance: hinstance,
+                hIcon: crate::resources::app_icon(),
                 lpszClassName: as_pcwstr(&class_name_wide),
                 ..Default::default()
             };

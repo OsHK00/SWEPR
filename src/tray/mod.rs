@@ -5,8 +5,8 @@ use windows::Win32::UI::Shell::{
     NOTIFYICONDATAW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, DestroyMenu, LoadIconW, PostMessageW, SetForegroundWindow,
-    TrackPopupMenu, IDI_APPLICATION, MF_CHECKED, MF_SEPARATOR, MF_STRING, MF_UNCHECKED,
+    AppendMenuW, CreatePopupMenu, DestroyMenu, PostMessageW, SetForegroundWindow,
+    TrackPopupMenu, MF_CHECKED, MF_SEPARATOR, MF_STRING, MF_UNCHECKED,
     TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_NULL,
 };
 use crate::{log_info, log_warn};
@@ -47,11 +47,7 @@ impl TrayIcon {
             ..Default::default()
         };
 
-        unsafe {
-            let hicon = LoadIconW(None, IDI_APPLICATION)
-                .map_err(|e| format!("Fallo al cargar IDI_APPLICATION: {e}"))?;
-            nid.hIcon = hicon;
-        }
+        nid.hIcon = crate::resources::app_icon();
 
         let tip_chars = tr("SWEPR - Wallpaper Selector");
         let copy_len = tip_chars.len().min(nid.szTip.len());

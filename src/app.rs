@@ -544,6 +544,7 @@ impl App {
                 style: CS_HREDRAW | CS_VREDRAW,
                 lpfnWndProc: Some(wnd_proc),
                 hInstance: hinstance,
+                hIcon: crate::resources::app_icon(),
                 lpszClassName: as_pcwstr(&class_name_wide),
                 ..Default::default()
             };

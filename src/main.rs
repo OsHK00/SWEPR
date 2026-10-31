@@ -6,6 +6,7 @@ mod detector;
 mod i18n;
 mod log;
 mod panel;
+mod resources;
 mod scanner;
 mod thumbs;
 mod tray;

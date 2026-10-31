@@ -577,6 +577,7 @@ pub fn show_config_window(config: Arc<Mutex<AppConfig>>) {
             style: CS_HREDRAW | CS_VREDRAW,
             lpfnWndProc: Some(config_wnd_proc),
             hInstance: hinstance,
+            hIcon: crate::resources::app_icon(),
             lpszClassName: as_pcwstr(&class_name_wide),
             ..Default::default()
         };

@@ -1,3 +1,7 @@
+
+
+![SWEPR logo](resources/logo.png)
+
 # SWEPR
 
 SWEPR is a lightweight Windows desktop wallpaper selector. It runs in the system tray and lets you browse a folder of images, preview them in a thumbnail panel, and apply a wallpaper without opening a separate desktop app.
@@ -38,6 +42,10 @@ Translation files are JSON files in `languages`, named with a language code such
 │   ├── en.json              English interface text
 │   ├── es.json              Spanish interface text
 │   └── README.md            Instructions for adding translations
+├── resources/
+│   ├── logo.png             Project logo shown in this README
+│   ├── swepr.ico            Application icon for Windows
+│   └── swepr.rc             Windows icon resource definition
 ├── src/
 │   ├── app.rs               Application startup, events, and coordination
 │   ├── config/
@@ -52,6 +60,7 @@ Translation files are JSON files in `languages`, named with a language code such
 │   ├── i18n.rs              Loading and selection of translations
 │   ├── log.rs               Application logging
 │   ├── panel/mod.rs         Thumbnail panel and its interactions
+│   ├── resources.rs         Embedded application icon loader
 │   ├── scanner/mod.rs       Wallpaper folder scanning
 │   ├── thumbs/mod.rs        Thumbnail creation and cache
 │   ├── tray/mod.rs          System tray icon and context menu
