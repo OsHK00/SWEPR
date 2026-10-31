@@ -92,7 +92,18 @@ impl WallpaperManager {
         }
     }
 
-
+    /// Obtiene la ruta del fondo de pantalla actualmente activo en Windows.
+    pub fn get_current_wallpaper(&self) -> Result<std::path::PathBuf, String> {
+        let wallpaper = self.wallpaper.as_ref().ok_or("IDesktopWallpaper no inicializado")?;
+        // Consulta IDesktopWallpaper con monitor NULL para obtener el fondo principal
+        unsafe {
+            let path_pwstr = wallpaper
+                .GetWallpaper(PCWSTR(std::ptr::null()))
+                .map_err(|e| format!("GetWallpaper fallo: {e}"))?;
+            let path_str = path_pwstr.to_string().map_err(|e| format!("{e}"))?;
+            Ok(std::path::PathBuf::from(path_str))
+        }
+    }
 }
 
 impl Drop for WallpaperManager {

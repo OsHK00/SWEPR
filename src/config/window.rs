@@ -6,7 +6,7 @@ use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassW,
-    CS_HREDRAW, CS_VREDRAW, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WS_CAPTION, WS_OVERLAPPEDWINDOW, WS_SYSMENU, WS_VISIBLE,
+    CS_HREDRAW, CS_VREDRAW, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WS_CAPTION, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU, WS_VISIBLE,
     GetDlgItem, SendMessageW, SetWindowTextW,
 };
 
@@ -133,11 +133,11 @@ unsafe extern "system" fn config_wnd_proc(
             );
             y += 40;
 
-            // Detalle de miniatura (grupo de radios)
+            // Calidad / Detalle de miniatura (grupo de radios)
             let _ = CreateWindowExW(
                 windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(0),
                 as_pcwstr(&to_wide_chars("STATIC")),
-                as_pcwstr(&to_wide_chars("Detalle de miniatura:")),
+                as_pcwstr(&to_wide_chars("Calidad de miniaturas (ahorro de RAM):")),
                 windows::Win32::UI::WindowsAndMessaging::WS_CHILD | windows::Win32::UI::WindowsAndMessaging::WS_VISIBLE,
                 x, y, w, 16, hwnd, windows::Win32::UI::WindowsAndMessaging::HMENU(std::ptr::null_mut()), None, None,
             );
@@ -145,38 +145,38 @@ unsafe extern "system" fn config_wnd_proc(
             let _ = CreateWindowExW(
                 windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(0),
                 as_pcwstr(&to_wide_chars("BUTTON")),
-                as_pcwstr(&to_wide_chars("Pequena (64 px)")),
+                as_pcwstr(&to_wide_chars("Pequena (64 px) — Menor uso de memoria")),
                 windows::Win32::UI::WindowsAndMessaging::WS_CHILD | windows::Win32::UI::WindowsAndMessaging::WS_VISIBLE | windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(4),
                 x, y, w, 24, hwnd, hmenu(IDC_THUMB_CHK_64), None, None,
             );
             let _ = CreateWindowExW(
                 windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(0),
                 as_pcwstr(&to_wide_chars("BUTTON")),
-                as_pcwstr(&to_wide_chars("Estandar (128 px)")),
+                as_pcwstr(&to_wide_chars("Estandar (128 px) — Recomendado")),
                 windows::Win32::UI::WindowsAndMessaging::WS_CHILD | windows::Win32::UI::WindowsAndMessaging::WS_VISIBLE | windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(4),
                 x, y + 24, w, 24, hwnd, hmenu(IDC_THUMB_CHK_128), None, None,
             );
             let _ = CreateWindowExW(
                 windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(0),
                 as_pcwstr(&to_wide_chars("BUTTON")),
-                as_pcwstr(&to_wide_chars("Grande (256 px)")),
+                as_pcwstr(&to_wide_chars("Grande (256 px) — Mayor nitidez")),
                 windows::Win32::UI::WindowsAndMessaging::WS_CHILD | windows::Win32::UI::WindowsAndMessaging::WS_VISIBLE | windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(4),
                 x, y + 48, w, 24, hwnd, hmenu(IDC_THUMB_CHK_256), None, None,
             );
             let _ = CreateWindowExW(
                 windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(0),
                 as_pcwstr(&to_wide_chars("BUTTON")),
-                as_pcwstr(&to_wide_chars("Muy grande (512 px)")),
+                as_pcwstr(&to_wide_chars("Muy grande (512 px) — Maximo detalle")),
                 windows::Win32::UI::WindowsAndMessaging::WS_CHILD | windows::Win32::UI::WindowsAndMessaging::WS_VISIBLE | windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(4),
                 x, y + 72, w, 24, hwnd, hmenu(IDC_THUMB_CHK_512), None, None,
             );
             y += 110;
 
-            // Nota sobre requisito de reinicio
+            // Nota sobre guardado
             let _ = CreateWindowExW(
                 windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(0),
                 as_pcwstr(&to_wide_chars("STATIC")),
-                as_pcwstr(&to_wide_chars("El cambio de detalle de miniatura se aplica al guardar.")),
+                as_pcwstr(&to_wide_chars("El cambio de calidad de miniatura se aplica al guardar.")),
                 windows::Win32::UI::WindowsAndMessaging::WS_CHILD | windows::Win32::UI::WindowsAndMessaging::WS_VISIBLE,
                 x, y, w, 16, hwnd, windows::Win32::UI::WindowsAndMessaging::HMENU(std::ptr::null_mut()), None, None,
             );
@@ -186,23 +186,16 @@ unsafe extern "system" fn config_wnd_proc(
             let _ = CreateWindowExW(
                 windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(0),
                 as_pcwstr(&to_wide_chars("BUTTON")),
-                as_pcwstr(&to_wide_chars("Aplicar")),
+                as_pcwstr(&to_wide_chars("Guardar")),
                 windows::Win32::UI::WindowsAndMessaging::WS_CHILD | windows::Win32::UI::WindowsAndMessaging::WS_VISIBLE ,
-                x, y, 80, 30, hwnd, hmenu(IDC_APPLY_BTN), None, None,
+                x, y, 90, 30, hwnd, hmenu(IDC_APPLY_BTN), None, None,
             );
             let _ = CreateWindowExW(
                 windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(0),
                 as_pcwstr(&to_wide_chars("BUTTON")),
                 as_pcwstr(&to_wide_chars("Cancelar")),
                 windows::Win32::UI::WindowsAndMessaging::WS_CHILD | windows::Win32::UI::WindowsAndMessaging::WS_VISIBLE ,
-                x + 90, y, 80, 30, hwnd, hmenu(IDC_CANCEL_BTN), None, None,
-            );
-            let _ = CreateWindowExW(
-                windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(0),
-                as_pcwstr(&to_wide_chars("BUTTON")),
-                as_pcwstr(&to_wide_chars("Cerrar")),
-                windows::Win32::UI::WindowsAndMessaging::WS_CHILD | windows::Win32::UI::WindowsAndMessaging::WS_VISIBLE ,
-                x + 180, y, 80, 30, hwnd, hmenu(IDC_EXIT_BTN), None, None,
+                x + 100, y, 90, 30, hwnd, hmenu(IDC_CANCEL_BTN), None, None,
             );
 
             // Cargar valores de config
@@ -397,6 +390,7 @@ unsafe extern "system" fn config_wnd_proc(
                             );
                         }
                     }
+                    let _ = DestroyWindow(hwnd);
                 }
                 IDC_THUMB_CHK_64 => {
                     log_info!("Radio miniatura: Pequena (64 px) seleccionada");
@@ -465,7 +459,7 @@ pub fn show_config_window(config: Arc<Mutex<AppConfig>>) {
             windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(0),
             as_pcwstr(&class_name_wide),
             as_pcwstr(&to_wide_chars("SWEPR - Configuración")),
-            WS_OVERLAPPEDWINDOW | WS_VISIBLE | WS_SYSMENU | WS_CAPTION,
+            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_VISIBLE,
             100, 100, 540, 440,
             None, None, hinstance, None,
         ) {

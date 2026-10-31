@@ -10,9 +10,9 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GetCursorPos, GetWindowRect, KillTimer, LoadCursorW, RegisterClassW, SetCursor, SetTimer, SetWindowPos, ShowWindow, UnregisterClassW,
-    CS_HREDRAW, CS_VREDRAW, HWND_TOPMOST, IDC_ARROW, SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOWNA, WM_CREATE, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCHITTEST, WM_PAINT, WM_SETCURSOR, WM_TIMER, WNDCLASSW,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, GetCursorPos, GetWindowRect, KillTimer, LoadCursorW, RegisterClassW, SetCursor, SetTimer, SetWindowPos, ShowWindow,
+    CS_HREDRAW, CS_VREDRAW, HWND_TOPMOST, IDC_ARROW, SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOW, WM_CREATE, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCHITTEST, WM_PAINT, WM_SETCURSOR, WM_TIMER, WNDCLASSW,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 const PANEL_CLASS_NAME: &str = "SWEPR_PanelWindowClass";
@@ -24,11 +24,11 @@ const AUTO_CLOSE_CHECK_MS: u32 = 100;
 const THUMB_W: i32 = 160;
 const THUMB_H: i32 = 90;
 const THUMB_MARGIN: i32 = 8;
-const THUMB_LINE_THICK: i32 = 2;
-const HOVER_SCALE: f32 = 1.1;
+
 const HOVER_ANIM_TIMER_ID: usize = 8003;
-const HOVER_ANIM_DURATION_MS: i32 = 250;
 const HOVER_ANIM_STEP_MS: u32 = 16;
+
+
 
 #[derive(Clone)]
 struct PanelState {
@@ -39,15 +39,12 @@ struct PanelState {
     animating: bool,
 }
 
-struct HoverAnim {
-    start_scale: f32,
-    target_scale: f32,
-    start_time: std::time::Instant,
-    animating: bool,
-}
+
 
 static PANEL_STATE: Mutex<Option<PanelState>> = Mutex::new(None);
 static PANEL_HWND: Mutex<Option<isize>> = Mutex::new(None);
+static PANEL_VISIBLE: Mutex<bool> = Mutex::new(false);
+static PANEL_EXITING: Mutex<bool> = Mutex::new(false);
 static PANEL_HINSTANCE: Mutex<Option<isize>> = Mutex::new(None);
 static PANEL_CLASS: Mutex<Option<Vec<u16>>> = Mutex::new(None);
 static PANEL_X: Mutex<i32> = Mutex::new(0);
@@ -58,12 +55,48 @@ static PANEL_THUMB_CACHE: Mutex<Option<ThumbnailCache>> = Mutex::new(None);
 static PANEL_SCANNED: Mutex<Option<Arc<Mutex<Vec<ScannedImage>>>>> = Mutex::new(None);
 static PANEL_SCROLL_OFFSET: Mutex<i32> = Mutex::new(0);
 static PANEL_HOVER_INDEX: Mutex<Option<usize>> = Mutex::new(None);
+static PANEL_SELECTED_INDEX: Mutex<Option<usize>> = Mutex::new(None);
 static PANEL_DRAGGING: Mutex<bool> = Mutex::new(false);
 static PANEL_LAST_MOUSE_X: Mutex<i32> = Mutex::new(0);
-static PANEL_PENDING_APPLY: Mutex<Option<usize>> = Mutex::new(None);
+static PANEL_DRAG_START_X: Mutex<i32> = Mutex::new(0);
+static PANEL_DRAG_START_Y: Mutex<i32> = Mutex::new(0);
 static PANEL_HOVER_SCALE: Mutex<f32> = Mutex::new(1.0);
-static PANEL_HOVER_ANIM: Mutex<Option<HoverAnim>> = Mutex::new(None);
+static PANEL_THUMB_SCALES: Mutex<Vec<f32>> = Mutex::new(Vec::new());
+static PANEL_THUMB_TARGETS: Mutex<Vec<f32>> = Mutex::new(Vec::new());
+static PANEL_THUMB_ANIM: Mutex<bool> = Mutex::new(false);
 static PANEL_CURRENT_WALLPAPER: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
+
+/// Actualiza el objetivo de animación hover/foco para las miniaturas e inicia el temporizador de interpolación.
+fn set_hover_target(hwnd: HWND, new_hover: Option<usize>) {
+    let prev_hover = if let Ok(g) = PANEL_HOVER_INDEX.lock() { *g } else { None };
+    if prev_hover == new_hover {
+        return;
+    }
+    if let Ok(mut g) = PANEL_HOVER_INDEX.lock() { *g = new_hover; }
+
+    let n = if let Ok(g) = PANEL_SCANNED.lock() {
+        if let Some(arc) = g.clone() {
+            if let Ok(v) = arc.lock() { v.len() } else { 0 }
+        } else { 0 }
+    } else { 0 };
+
+    if n > 0 {
+        if let Ok(mut s) = PANEL_THUMB_SCALES.lock() {
+            s.resize(n, 1.0);
+        }
+        if let Ok(mut t) = PANEL_THUMB_TARGETS.lock() {
+            t.resize(n, 1.0);
+            for v in t.iter_mut() { *v = 1.0; }
+            if let Some(idx) = new_hover {
+                if idx < t.len() { t[idx] = 0.9; }
+            }
+        }
+        if let Ok(mut anim) = PANEL_THUMB_ANIM.lock() { *anim = true; }
+        unsafe {
+            let _ = SetTimer(hwnd, HOVER_ANIM_TIMER_ID, HOVER_ANIM_STEP_MS, None);
+        }
+    }
+}
 
 unsafe extern "system" fn panel_wnd_proc(
     hwnd: HWND,
@@ -78,6 +111,7 @@ unsafe extern "system" fn panel_wnd_proc(
         }
         WM_TIMER => {
             if wparam.0 == ANIM_TIMER_ID {
+                let mut should_hide = false;
                 if let Ok(mut stg) = PANEL_STATE.lock() {
                     if let Some(ref mut st) = *stg {
                         if st.animating {
@@ -93,38 +127,36 @@ unsafe extern "system" fn panel_wnd_proc(
                             if progress >= 1.0 {
                                 st.animating = false;
                                 let _ = KillTimer(hwnd, ANIM_TIMER_ID);
+                                should_hide = if let Ok(e) = PANEL_EXITING.lock() { *e } else { false };
                             }
                         }
                     }
                 }
+                if should_hide {
+                    let _ = windows::Win32::UI::WindowsAndMessaging::ShowWindow(hwnd, windows::Win32::UI::WindowsAndMessaging::SW_HIDE);
+                    if let Ok(mut v) = PANEL_VISIBLE.lock() { *v = false; }
+                    if let Ok(mut e) = PANEL_EXITING.lock() { *e = false; }
+                    if let Ok(mut stg) = PANEL_STATE.lock() { *stg = None; }
+                }
                 return LRESULT(0);
             }
             if wparam.0 == HOVER_ANIM_TIMER_ID {
-                if let Ok(mut ha) = PANEL_HOVER_ANIM.lock() {
-                    if let Some(ref mut a) = *ha {
-                        if a.animating {
-                            let elapsed = a.start_time.elapsed().as_millis() as f32;
-                            let progress = (elapsed / (HOVER_ANIM_DURATION_MS as f32)).min(1.0);
-                            let eased = 1.0 - (1.0 - progress).powi(2);
-                            let s = a.start_scale + (a.target_scale - a.start_scale) * eased;
-                            if let Ok(mut gs) = PANEL_HOVER_SCALE.lock() { *gs = s; }
-                            if let Ok(mut stg) = PANEL_STATE.lock() {
-                                if let Some(ref mut st) = *stg {
-                                    let px = if let Ok(g) = PANEL_X.lock() { *g } else { 0 };
-                                    let pw = if let Ok(g) = PANEL_WIDTH.lock() { *g } else { 800 };
-                                    let panel_h = (8.0 + THUMB_H as f32 * s + THUMB_LINE_THICK as f32) as i32;
-                                    let _ = SetWindowPos(hwnd, HWND_TOPMOST, px, st.current_y, pw, panel_h, SWP_NOACTIVATE | SWP_NOZORDER);
-                                    if progress >= 1.0 {
-                                        a.animating = false;
-                                        let _ = KillTimer(hwnd, HOVER_ANIM_TIMER_ID);
-                                        if a.target_scale == 1.0 {
-                                            let _ = SetWindowPos(hwnd, HWND_TOPMOST, px, st.current_y, pw, 8 + THUMB_H, SWP_NOACTIVATE | SWP_NOZORDER);
-                                        }
-                                    }
-                                }
-                            }
+                let mut done = true;
+                if let (Ok(mut scales), Ok(targets)) = (PANEL_THUMB_SCALES.lock(), PANEL_THUMB_TARGETS.lock()) {
+                    for i in 0..scales.len().min(targets.len()) {
+                        let diff = targets[i] - scales[i];
+                        if diff.abs() > 0.001 {
+                            scales[i] += diff * 0.25;
+                            done = false;
+                        } else {
+                            scales[i] = targets[i];
                         }
                     }
+                }
+                let _ = windows::Win32::Graphics::Gdi::InvalidateRect(hwnd, None, true);
+                if done {
+                    if let Ok(mut a) = PANEL_THUMB_ANIM.lock() { *a = false; }
+                    let _ = KillTimer(hwnd, HOVER_ANIM_TIMER_ID);
                 }
                 return LRESULT(0);
             }
@@ -163,33 +195,43 @@ unsafe extern "system" fn panel_wnd_proc(
                 let images_opt = if let Ok(g) = PANEL_SCANNED.lock() { g.clone() } else { None };
                 let scroll = if let Ok(g) = PANEL_SCROLL_OFFSET.lock() { *g } else { 0 };
                 let hover = if let Ok(g) = PANEL_HOVER_INDEX.lock() { *g } else { None };
-                let hover_scale = if let Ok(g) = PANEL_HOVER_SCALE.lock() { *g } else { 1.0 };
+                let _hover_scale = if let Ok(g) = PANEL_HOVER_SCALE.lock() { *g } else { 1.0 };
                 let current_wp = if let Ok(g) = PANEL_CURRENT_WALLPAPER.lock() { g.clone() } else { None };
+                let selected = if let Ok(g) = PANEL_SELECTED_INDEX.lock() { *g } else { None };
 
 
                 if let (Some(cache), Some(images_arc)) = (cache_opt, images_opt) {
                     if let Ok(images) = images_arc.lock() {
-                        let mut x = THUMB_MARGIN - scroll;
+                        let half_g = 0;
                         for (idx, img) in images.iter().enumerate() {
                             let key = img.path.to_string_lossy().to_string();
-                            let scale = if hover == Some(idx) { hover_scale } else { 1.0 };
+                            let scale = PANEL_THUMB_SCALES.lock().ok().and_then(|v| v.get(idx).copied()).unwrap_or(1.0);
                             let tw = (THUMB_W as f32 * scale) as i32;
                             let th = (THUMB_H as f32 * scale) as i32;
-                            let draw_w = if hover == Some(idx) { tw } else { THUMB_W };
-                            let draw_h = if hover == Some(idx) { th } else { THUMB_H };
+                            let draw_w = tw.max(1);
+                            let draw_h = th.max(1);
+                            let base_x = THUMB_MARGIN - scroll + idx as i32 * (THUMB_W + THUMB_MARGIN);
+                            let mut x = base_x;
+                            if let Some(hi) = hover {
+                                if idx < hi { x -= half_g; }
+                                else if idx > hi { x += half_g; }
+                                else { x -= half_g; }
+                            }
+                            let draw_x = x + (THUMB_W - draw_w) / 2;
+                            let draw_y = 8 + (THUMB_H - draw_h) / 2;
                             let radius = 8i32;
-                            let clip_rgn = CreateRoundRectRgn(x, 8, x + draw_w, 8 + draw_h, radius * 2, radius * 2);
+                            let clip_rgn = CreateRoundRectRgn(draw_x, draw_y, draw_x + draw_w, draw_y + draw_h, radius * 2, radius * 2);
                             let _ = SelectClipRgn(mem_dc, clip_rgn);
                             if let Some(thumb) = cache.get(&key) {
                                 let bmp_dc = CreateCompatibleDC(hdc);
                                 let old = SelectObject(bmp_dc, windows::Win32::Graphics::Gdi::HBITMAP(thumb.hbitmap as *mut _));
                                 let _ = SetStretchBltMode(mem_dc, COLORONCOLOR);
-                                let _ = StretchBlt(mem_dc, x, 8, draw_w, draw_h, bmp_dc, 0, 0, thumb.width, thumb.height, SRCCOPY);
+                                let _ = StretchBlt(mem_dc, draw_x, draw_y, draw_w, draw_h, bmp_dc, 0, 0, thumb.width, thumb.height, SRCCOPY);
                                 SelectObject(bmp_dc, old);
                                 let _ = DeleteDC(bmp_dc);
                             } else {
                                 let ph = CreateSolidBrush(windows::Win32::Foundation::COLORREF(0x00303030));
-                                let r = RECT { left: x, top: 8, right: x + draw_w, bottom: 8 + draw_h };
+                                let r = RECT { left: draw_x, top: draw_y, right: draw_x + draw_w, bottom: draw_y + draw_h };
                                 let _ = FillRect(mem_dc, &r, ph);
                                 let _ = DeleteObject(ph);
                             }
@@ -202,17 +244,23 @@ unsafe extern "system" fn panel_wnd_proc(
                                 } else {
                                     windows::Win32::Foundation::COLORREF(0x0000FF00)
                                 };
-                                let rgn = CreateRoundRectRgn(x, 8, x + draw_w, 8 + draw_h, radius * 2, radius * 2);
+                                let rgn = CreateRoundRectRgn(draw_x, draw_y, draw_x + draw_w, draw_y + draw_h, radius * 2, radius * 2);
                                 let brush = CreateSolidBrush(color);
                                 let _ = FrameRgn(mem_dc, rgn, brush, 2, 2);
                                 let _ = DeleteObject(brush);
                                 let _ = DeleteObject(rgn);
                             }
-                            x += THUMB_W + THUMB_MARGIN;
+                            if selected == Some(idx) {
+                                let rgn = CreateRoundRectRgn(draw_x, draw_y, draw_x + draw_w, draw_y + draw_h, radius * 2, radius * 2);
+                                let brush = CreateSolidBrush(windows::Win32::Foundation::COLORREF(0x0000FFFF));
+                                let _ = FrameRgn(mem_dc, rgn, brush, 2, 2);
+                                let _ = DeleteObject(brush);
+                                let _ = DeleteObject(rgn);
+                            }
                         }
-                        let total_w = images.len() as i32 * (THUMB_W + THUMB_MARGIN) + THUMB_MARGIN;
+                        let total_w = images.len() as i32 * (THUMB_W + THUMB_MARGIN) + THUMB_MARGIN + (THUMB_W / 10);
                         if total_w > width {
-                            let track_y = height - 4;
+                            let track_y = 8 + THUMB_H + 8;
                             let track_h = 3;
                             let track_brush = CreateSolidBrush(windows::Win32::Foundation::COLORREF(0x00404040));
                             let track_rect = RECT { left: 0, top: track_y, right: width, bottom: track_y + track_h };
@@ -242,52 +290,46 @@ unsafe extern "system" fn panel_wnd_proc(
         WM_LBUTTONDOWN => {
             let x = (lparam.0 & 0xFFFF) as i16 as i32;
             let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
-            // Hit testing
-            let mut pending_apply: Option<usize> = None;
-            let scroll = if let Ok(g) = PANEL_SCROLL_OFFSET.lock() { *g } else { 0 };
-            let hover_idx = if let Ok(g) = PANEL_HOVER_INDEX.lock() { *g } else { None };
-            let hover_scale = if let Ok(g) = PANEL_HOVER_SCALE.lock() { *g } else { 1.0 };
-            let images_opt = if let Ok(g) = PANEL_SCANNED.lock() { g.clone() } else { None };
-            if let Some(images_arc) = images_opt {
-                if let Ok(images) = images_arc.lock() {
-                    let mut tx = THUMB_MARGIN - scroll;
-                    for (idx, img) in images.iter().enumerate() {
-                        let tw = (THUMB_W as f32 * if Some(idx) == hover_idx { hover_scale } else { 1.0 }) as i32;
-                        let th = (THUMB_H as f32 * if Some(idx) == hover_idx { hover_scale } else { 1.0 }) as i32;
-                        if x >= tx && x < tx + tw && y >= 8 && y < 8 + th {
-                            log_info!("Panel: clic en miniatura {} -> {:?}", idx, img.path);
-                            pending_apply = Some(idx);
-                        }
-                        tx += THUMB_W + THUMB_MARGIN;
-                    }
-                }
-            }
-            // Preparar: pending_apply indica miniatura a aplicar en click; el drag-scroll se decide en MOUSEMOVE/LBUTTONUP
             if let Ok(mut g) = PANEL_DRAGGING.lock() { *g = true; }
             if let Ok(mut g) = PANEL_LAST_MOUSE_X.lock() { *g = x; }
-            if let Ok(mut g) = PANEL_PENDING_APPLY.lock() { *g = pending_apply; }
+            if let Ok(mut g) = PANEL_DRAG_START_X.lock() { *g = x; }
+            if let Ok(mut g) = PANEL_DRAG_START_Y.lock() { *g = y; }
             LRESULT(0)
         }
         WM_LBUTTONUP => {
-            if let Ok(mut g) = PANEL_DRAGGING.lock() { *g = false; }
-            // Si fue un click (sin arrastre) sobre una miniatura, aplicar el wallpaper
-            let pending = if let Ok(mut g) = PANEL_PENDING_APPLY.lock() { g.take() } else { None };
-            let last_x = if let Ok(g) = PANEL_LAST_MOUSE_X.lock() { *g } else { 0 };
+            let was_dragging = if let Ok(mut g) = PANEL_DRAGGING.lock() {
+                let was = *g;
+                *g = false;
+                was
+            } else { false };
+
+            let start_x = if let Ok(g) = PANEL_DRAG_START_X.lock() { *g } else { 0 };
+            let start_y = if let Ok(g) = PANEL_DRAG_START_Y.lock() { *g } else { 0 };
             let x = (lparam.0 & 0xFFFF) as i16 as i32;
-            if let Some(idx) = pending {
-                if (x - last_x).abs() <= 3 {
-                    // Click completo detectado -> aplicar wallpaper
-                    let path = if let Ok(images_arc) = PANEL_SCANNED.lock() {
-                        if let Some(images) = images_arc.clone() {
-                            if let Ok(images) = images.lock() {
-                                images.get(idx).map(|img| img.path.clone())
-                            } else { None }
-                        } else { None }
-                    } else { None };
-                    if let Some(p) = path {
-                        log_info!("Panel: clic en miniatura {} -> {:?}", idx, p);
-                        app::request_apply_wallpaper(&p);
-                        hide_panel();
+            let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
+
+            // Si el cursor se movió 5 px o menos, es un clic sobre la miniatura
+            if was_dragging && (x - start_x).abs() <= 5 && (y - start_y).abs() <= 5 {
+                let scroll = if let Ok(g) = PANEL_SCROLL_OFFSET.lock() { *g } else { 0 };
+                let hover_idx = if let Ok(g) = PANEL_HOVER_INDEX.lock() { *g } else { None };
+                let images_opt = if let Ok(g) = PANEL_SCANNED.lock() { g.clone() } else { None };
+                if let Some(images_arc) = images_opt {
+                    if let Ok(images) = images_arc.lock() {
+                        let half_g = 0;
+                        for (idx, img) in images.iter().enumerate() {
+                            let mut tx = THUMB_MARGIN - scroll + idx as i32 * (THUMB_W + THUMB_MARGIN);
+                            if let Some(hi) = hover_idx {
+                                if idx < hi { tx -= half_g; }
+                                else if idx > hi { tx += half_g; }
+                                else { tx -= half_g; }
+                            }
+                            if x >= tx && x < tx + THUMB_W && y >= 8 && y < 8 + THUMB_H {
+                                log_info!("Panel: clic en miniatura {} -> {:?}", idx, img.path);
+                                app::request_apply_wallpaper(&img.path);
+                                hide_panel();
+                                break;
+                            }
+                        }
                     }
                 }
             }
@@ -303,36 +345,27 @@ unsafe extern "system" fn panel_wnd_proc(
             let mut new_hover = None;
             if let Some(images_arc) = images_opt {
                 if let Ok(images) = images_arc.lock() {
-                    let mut tx = THUMB_MARGIN - scroll;
+                    let half_g = 0;
                     for (idx, _img) in images.iter().enumerate() {
-                        let tw = (THUMB_W as f32 * if Some(idx) == hover_idx { hover_scale } else { 1.0 }) as i32;
-                        let _th = (THUMB_H as f32 * if Some(idx) == hover_idx { hover_scale } else { 1.0 }) as i32;
-                        if x >= tx && x < tx + tw {
+                        let _tw = (THUMB_W as f32 * if Some(idx) == hover_idx { hover_scale } else { 1.0 }) as i32;
+                        let mut tx = THUMB_MARGIN - scroll + idx as i32 * (THUMB_W + THUMB_MARGIN);
+                        if let Some(hi) = hover_idx {
+                            if idx < hi { tx -= half_g; }
+                            else if idx > hi { tx += half_g; }
+                            else { tx -= half_g; }
+                        }
+                        if x >= tx && x < tx + THUMB_W {
                             new_hover = Some(idx);
                             break;
                         }
-                        tx += THUMB_W + THUMB_MARGIN;
                     }
                 }
             }
-            let prev_hover = if let Ok(g) = PANEL_HOVER_INDEX.lock() { *g } else { None };
-            if let Ok(mut g) = PANEL_HOVER_INDEX.lock() { *g = new_hover; }
-
-            // Animación del hover: la miniatura con línea baja un poco hacia abajo
-            if prev_hover != new_hover {
-                let target = if new_hover.is_some() { HOVER_SCALE } else { 1.0 };
-                let cur = if let Ok(g) = PANEL_HOVER_SCALE.lock() { *g } else { 1.0 };
-                if let Ok(mut ha) = PANEL_HOVER_ANIM.lock() {
-                    *ha = Some(HoverAnim { start_scale: cur, target_scale: target, start_time: std::time::Instant::now(), animating: true });
-                }
-                let _ = SetTimer(hwnd, HOVER_ANIM_TIMER_ID, HOVER_ANIM_STEP_MS, None);
-            }
+            set_hover_target(hwnd, new_hover);
 
             // Drag scroll (solo si está arrastrando)
             let dragging = if let Ok(g) = PANEL_DRAGGING.lock() { *g } else { false };
             if dragging {
-                // Si hubo movimiento real, ya no es un click sobre la miniatura
-                if let Ok(mut g) = PANEL_PENDING_APPLY.lock() { *g = None; }
                 let last = if let Ok(g) = PANEL_LAST_MOUSE_X.lock() { *g } else { 0 };
                 let delta = last - x;
                 if let Ok(mut g) = PANEL_SCROLL_OFFSET.lock() {
@@ -347,7 +380,7 @@ unsafe extern "system" fn panel_wnd_proc(
                         }
                     }
                     let panel_w = PANEL_WIDTH.lock().map(|g| *g).unwrap_or(800);
-                    let max_scroll = (image_count as i32 * (THUMB_W + THUMB_MARGIN) - panel_w).max(0);
+                    let max_scroll = (image_count as i32 * (THUMB_W + THUMB_MARGIN) + (THUMB_W / 10) - panel_w).max(0);
                     *g = (*g + delta).max(0).min(max_scroll);
                 }
                 if let Ok(mut g) = PANEL_LAST_MOUSE_X.lock() { *g = x; }
@@ -390,6 +423,56 @@ unsafe extern "system" fn panel_wnd_proc(
                 hide_panel();
                 return LRESULT(0);
             }
+            let key = wparam.0 as i32;
+            if key == 0x25 || key == 0x27 || key == 0x0D { // Left, Right, Enter
+                // Obtener cantidad de imagenes
+                let count = if let Ok(g) = PANEL_SCANNED.lock() {
+                    if let Some(arc) = g.clone() {
+                        if let Ok(v) = arc.lock() { v.len() } else { 0 }
+                    } else { 0 }
+                } else { 0 };
+                if count == 0 { return LRESULT(0); }
+                if key == 0x25 { // Left (VK_LEFT)
+                    let mut sel = PANEL_SELECTED_INDEX.lock().ok().and_then(|g| *g).unwrap_or(0);
+                    if sel > 0 { sel -= 1; }
+                    if let Ok(mut g) = PANEL_SELECTED_INDEX.lock() { *g = Some(sel); }
+                    set_hover_target(hwnd, Some(sel));
+                } else if key == 0x27 { // Right (VK_RIGHT)
+                    let mut sel = PANEL_SELECTED_INDEX.lock().ok().and_then(|g| *g).unwrap_or(0);
+                    if sel + 1 < count { sel += 1; }
+                    if let Ok(mut g) = PANEL_SELECTED_INDEX.lock() { *g = Some(sel); }
+                    set_hover_target(hwnd, Some(sel));
+                } else if key == 0x0D { // Enter -> aplicar y cerrar panel
+                    let sel = PANEL_SELECTED_INDEX.lock().ok().and_then(|g| *g).unwrap_or(0);
+                    let path = if let Ok(g) = PANEL_SCANNED.lock() {
+                        if let Some(arc) = g.clone() {
+                            if let Ok(v) = arc.lock() { v.get(sel).map(|img| img.path.clone()) } else { None }
+                        } else { None }
+                    } else { None };
+                    if let Some(p) = path {
+                        log_info!("Panel: Enter en miniatura {} -> {:?}", sel, p);
+                        crate::app::request_apply_wallpaper(&p);
+                        crate::panel::set_current_wallpaper(&p);
+                        hide_panel();
+                    }
+                    return LRESULT(0);
+                }
+                // Ajustar scroll para mantener seleccion visible
+                let sel = PANEL_SELECTED_INDEX.lock().ok().and_then(|g| *g).unwrap_or(0);
+                let panel_w = PANEL_WIDTH.lock().map(|g| *g).unwrap_or(800);
+                let scroll = PANEL_SCROLL_OFFSET.lock().map(|g| *g).unwrap_or(0);
+                let item_x = sel as i32 * (THUMB_W + THUMB_MARGIN) + THUMB_MARGIN;
+                let mut new_scroll = scroll;
+                if item_x < scroll { new_scroll = item_x.saturating_sub(THUMB_MARGIN); }
+                let right_edge = item_x + THUMB_W;
+                if right_edge > scroll + panel_w { new_scroll = right_edge - panel_w + THUMB_MARGIN; }
+                new_scroll = new_scroll.max(0);
+                if let Ok(mut g) = PANEL_SCROLL_OFFSET.lock() { *g = new_scroll; }
+                if let Some(hwnd_val) = PANEL_HWND.lock().ok().and_then(|g| *g) {
+                    unsafe { let _ = windows::Win32::Graphics::Gdi::InvalidateRect(HWND(hwnd_val as *mut _), None, true); }
+                }
+                return LRESULT(0);
+            }
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_KILLFOCUS => {
@@ -415,27 +498,42 @@ unsafe extern "system" fn panel_wnd_proc(
     }
 }
 
+/// Fuerza el foco del teclado y la activación en primer plano hacia la ventana del panel.
+/// Utiliza AttachThreadInput para salvar las restricciones de cambio de foco entre hilos de Windows.
+unsafe fn force_focus(hwnd: HWND) {
+    use windows::Win32::Foundation::BOOL;
+    use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+    use windows::Win32::UI::Input::KeyboardAndMouse::{SetActiveWindow, SetFocus};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        BringWindowToTop, GetForegroundWindow, GetWindowThreadProcessId, SetForegroundWindow,
+    };
+
+    let fg_hwnd = GetForegroundWindow();
+    let fg_thread = GetWindowThreadProcessId(fg_hwnd, None);
+    let cur_thread = GetCurrentThreadId();
+
+    if fg_thread != 0 && fg_thread != cur_thread {
+        let _ = AttachThreadInput(cur_thread, fg_thread, BOOL(1));
+        let _ = BringWindowToTop(hwnd);
+        let _ = SetForegroundWindow(hwnd);
+        let _ = SetActiveWindow(hwnd);
+        let _ = SetFocus(hwnd);
+        let _ = AttachThreadInput(cur_thread, fg_thread, BOOL(0));
+    } else {
+        let _ = BringWindowToTop(hwnd);
+        let _ = SetForegroundWindow(hwnd);
+        let _ = SetActiveWindow(hwnd);
+        let _ = SetFocus(hwnd);
+    }
+}
+
 pub fn show_panel() {
     unsafe {
-        if let Ok(guard) = PANEL_HWND.lock() {
-            if guard.is_some() {
-                return;
-            }
+        if let Ok(v) = PANEL_VISIBLE.lock() {
+            if *v { return; }
         }
-        let hinstance = match GetModuleHandleW(None) {
-            Ok(h) => HINSTANCE(h.0),
-            Err(_) => return,
-        };
-        let class_name_wide = to_wide_chars(PANEL_CLASS_NAME);
-        let wc = WNDCLASSW {
-            style: CS_HREDRAW | CS_VREDRAW,
-            lpfnWndProc: Some(panel_wnd_proc),
-            hInstance: hinstance,
-            lpszClassName: as_pcwstr(&class_name_wide),
-            ..Default::default()
-        };
-        let _ = RegisterClassW(&wc);
 
+        // Posicion y dimensiones segun monitor actual
         let mut pt = POINT::default();
         let _ = GetCursorPos(&mut pt);
         let hmon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
@@ -446,29 +544,102 @@ pub fn show_panel() {
         let _ = GetMonitorInfoW(hmon, &mut mi);
 
         let width = (mi.rcWork.right - mi.rcWork.left).max(THUMB_W + THUMB_MARGIN * 2);
-        // Altura ajustada al contenido (margen superior + miniatura), sin espacio muerto
-        let height = 8 + THUMB_H;
+        let height = 8 + THUMB_H + 8 + 3;
         let x = mi.rcWork.left;
         let start_y = mi.rcMonitor.top - height;
         let target_y = mi.rcMonitor.top;
 
-        let hwnd = match CreateWindowExW(
-            WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-            as_pcwstr(&class_name_wide),
-            as_pcwstr(&to_wide_chars("SWEPR Panel")),
-            WS_POPUP,
-            x,
-            start_y,
-            width,
-            height,
-            None,
-            None,
-            hinstance,
-            None,
-        ) {
-            Ok(h) => h,
-            Err(_) => return,
+        // Calcular fondo seleccionado actual y posición de scroll centrada
+        let (selected_idx, initial_scroll, image_count) = {
+            let current_wp = PANEL_CURRENT_WALLPAPER.lock().ok().and_then(|g| g.clone());
+            let images_opt = PANEL_SCANNED.lock().ok().and_then(|g| g.clone());
+            if let Some(images_arc) = images_opt {
+                if let Ok(images) = images_arc.lock() {
+                    let count = images.len();
+                    let idx = if let Some(ref cur_path) = current_wp {
+                        images.iter().position(|img| &img.path == cur_path).unwrap_or(0)
+                    } else {
+                        0
+                    };
+                    let item_x = idx as i32 * (THUMB_W + THUMB_MARGIN) + THUMB_MARGIN;
+                    let center_scroll = (item_x + THUMB_W / 2) - (width / 2);
+                    let max_scroll = (count as i32 * (THUMB_W + THUMB_MARGIN) + (THUMB_W / 10) - width).max(0);
+                    let scroll = center_scroll.clamp(0, max_scroll);
+                    (idx, scroll, count)
+                } else {
+                    (0, 0, 0)
+                }
+            } else {
+                (0, 0, 0)
+            }
         };
+
+        // Reutilizar ventana cacheada si existe
+        let cached = PANEL_HWND.lock().ok().and_then(|g| *g);
+        let hwnd = if let Some(hwnd_val) = cached {
+            HWND(hwnd_val as *mut _)
+        } else {
+            let hinstance = match GetModuleHandleW(None) {
+                Ok(h) => HINSTANCE(h.0),
+                Err(_) => return,
+            };
+            let class_name_wide = to_wide_chars(PANEL_CLASS_NAME);
+            let wc = WNDCLASSW {
+                style: CS_HREDRAW | CS_VREDRAW,
+                lpfnWndProc: Some(panel_wnd_proc),
+                hInstance: hinstance,
+                lpszClassName: as_pcwstr(&class_name_wide),
+                ..Default::default()
+            };
+            let _ = RegisterClassW(&wc);
+
+            let hwnd = match CreateWindowExW(
+                WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+                as_pcwstr(&class_name_wide),
+                as_pcwstr(&to_wide_chars("SWEPR Panel")),
+                WS_POPUP,
+                x,
+                start_y,
+                width,
+                height,
+                None,
+                None,
+                hinstance,
+                None,
+            ) {
+                Ok(h) => h,
+                Err(_) => return,
+            };
+
+            if let Ok(mut g) = PANEL_HWND.lock() { *g = Some(hwnd.0 as isize); }
+            if let Ok(mut g) = PANEL_HINSTANCE.lock() { *g = Some(hinstance.0 as isize); }
+            if let Ok(mut g) = PANEL_CLASS.lock() { *g = Some(class_name_wide.clone()); }
+            hwnd
+        };
+
+        if let Ok(mut g) = PANEL_X.lock() { *g = x; }
+        if let Ok(mut g) = PANEL_WIDTH.lock() { *g = width; }
+        if let Ok(mut g) = PANEL_HEIGHT.lock() { *g = height; }
+        if let Ok(mut g) = PANEL_SCROLL_OFFSET.lock() { *g = initial_scroll; }
+        if let Ok(mut g) = PANEL_SELECTED_INDEX.lock() { *g = Some(selected_idx); }
+        if let Ok(mut g) = PANEL_HOVER_INDEX.lock() { *g = Some(selected_idx); }
+        if let Ok(mut g) = PANEL_DRAGGING.lock() { *g = false; }
+        if let Ok(mut gs) = PANEL_HOVER_SCALE.lock() { *gs = 1.0; }
+
+        if image_count > 0 {
+            if let Ok(mut s) = PANEL_THUMB_SCALES.lock() {
+                s.resize(image_count, 1.0);
+                for (i, v) in s.iter_mut().enumerate() {
+                    *v = if i == selected_idx { 0.9 } else { 1.0 };
+                }
+            }
+            if let Ok(mut t) = PANEL_THUMB_TARGETS.lock() {
+                t.resize(image_count, 1.0);
+                for (i, v) in t.iter_mut().enumerate() {
+                    *v = if i == selected_idx { 0.9 } else { 1.0 };
+                }
+            }
+        }
 
         if let Ok(mut stg) = PANEL_STATE.lock() {
             *stg = Some(PanelState {
@@ -479,53 +650,66 @@ pub fn show_panel() {
                 animating: true,
             });
         }
-        if let Ok(mut g) = PANEL_HWND.lock() { *g = Some(hwnd.0 as isize); }
-        if let Ok(mut g) = PANEL_HINSTANCE.lock() { *g = Some(hinstance.0 as isize); }
-        if let Ok(mut g) = PANEL_CLASS.lock() { *g = Some(class_name_wide.clone()); }
-        if let Ok(mut g) = PANEL_X.lock() { *g = x; }
-        if let Ok(mut g) = PANEL_WIDTH.lock() { *g = width; }
-        if let Ok(mut g) = PANEL_HEIGHT.lock() { *g = height; }
-        if let Ok(mut g) = PANEL_SCROLL_OFFSET.lock() { *g = 0; }
-        if let Ok(mut g) = PANEL_HOVER_INDEX.lock() { *g = None; }
-        if let Ok(mut g) = PANEL_DRAGGING.lock() { *g = false; }
-        if let Ok(mut gs) = PANEL_HOVER_SCALE.lock() { *gs = 1.0; }
-        if let Ok(mut ha) = PANEL_HOVER_ANIM.lock() { *ha = None; }
-
         let _ = SetWindowPos(hwnd, HWND_TOPMOST, x, start_y, width, height, SWP_NOACTIVATE | SWP_NOZORDER);
-        let _ = ShowWindow(hwnd, SW_SHOWNA);
+
+        let _ = ShowWindow(hwnd, SW_SHOW);
+        force_focus(hwnd);
         let _ = SetTimer(hwnd, ANIM_TIMER_ID, ANIM_STEP_MS, None);
         let _ = SetTimer(hwnd, AUTO_CLOSE_TIMER_ID, AUTO_CLOSE_CHECK_MS, None);
-        log_info!("Panel: mostrado en monitor con animación desde arriba");
+        if let Ok(mut v) = PANEL_VISIBLE.lock() { *v = true; }
+        log_info!("Panel: mostrado en monitor con animacion desde arriba");
     }
 }
-
 pub fn hide_panel() {
     unsafe {
-        let hwnd_val = if let Ok(mut g) = PANEL_HWND.lock() { g.take() } else { None };
-        let hinst_val = if let Ok(mut g) = PANEL_HINSTANCE.lock() { g.take() } else { None };
-        let class_val = if let Ok(mut g) = PANEL_CLASS.lock() { g.take() } else { None };
-        if let Ok(mut stg) = PANEL_STATE.lock() { *stg = None; }
-        if let Ok(mut gs) = PANEL_HOVER_SCALE.lock() { *gs = 1.0; }
-        if let Ok(mut ha) = PANEL_HOVER_ANIM.lock() { *ha = None; }
-        if let Some(hv) = hwnd_val {
-            let hwnd = HWND(hv as *mut _);
-            let _ = KillTimer(hwnd, ANIM_TIMER_ID);
+        if let Ok(v) = PANEL_VISIBLE.lock() { if !*v { return; } }
+        if let Ok(e) = PANEL_EXITING.lock() { if *e { return; } }
+
+        if let Some(hwnd_val) = PANEL_HWND.lock().ok().and_then(|g| *g) {
+            let hwnd = HWND(hwnd_val as *mut _);
             let _ = KillTimer(hwnd, AUTO_CLOSE_TIMER_ID);
             let _ = KillTimer(hwnd, HOVER_ANIM_TIMER_ID);
-            let _ = DestroyWindow(hwnd);
-            if let (Some(iv), Some(cv)) = (hinst_val, class_val) {
-                let hinst = HINSTANCE(iv as *mut _);
-                let _ = UnregisterClassW(as_pcwstr(&cv), hinst);
+
+            let mut wr = RECT::default();
+            let _ = windows::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut wr);
+            let start_y = wr.top;
+            let height = if let Ok(g) = PANEL_HEIGHT.lock() { *g } else { 8 + THUMB_H + 8 + 3 };
+            let hmon = windows::Win32::Graphics::Gdi::MonitorFromWindow(hwnd, windows::Win32::Graphics::Gdi::MONITOR_DEFAULTTONEAREST);
+            let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+            let _ = windows::Win32::Graphics::Gdi::GetMonitorInfoW(hmon, &mut mi);
+            let target_y = mi.rcMonitor.top - height;
+
+            if let Ok(mut stg) = PANEL_STATE.lock() {
+                *stg = Some(PanelState {
+                    target_y,
+                    start_y,
+                    current_y: start_y,
+                    anim_start_time: std::time::Instant::now(),
+                    animating: true,
+                });
             }
-            log_info!("Panel: ocultado y destruido");
+            if let Ok(mut e) = PANEL_EXITING.lock() { *e = true; }
+            let _ = SetTimer(hwnd, ANIM_TIMER_ID, ANIM_STEP_MS, None);
+            log_info!("Panel: animando salida");
         }
     }
 }
 
 pub fn set_draw_context(cache: ThumbnailCache, images: Arc<Mutex<Vec<ScannedImage>>>) {
+    // Inicializar escalas por miniatura
+    if let Ok(imgs) = images.lock() {
+        let n = imgs.len();
+        if let Ok(mut s) = PANEL_THUMB_SCALES.lock() {
+            s.resize(n, 1.0);
+            for v in s.iter_mut() { if *v == 0.0 { *v = 1.0; } }
+        }
+        if let Ok(mut t) = PANEL_THUMB_TARGETS.lock() {
+            t.resize(n, 1.0);
+            for v in t.iter_mut() { *v = 1.0; }
+        }
+    }
     if let Ok(mut g) = PANEL_THUMB_CACHE.lock() { *g = Some(cache); }
     if let Ok(mut g) = PANEL_SCANNED.lock() { *g = Some(images); }
-    // Forzar repintado
     request_repaint();
 }
 
@@ -542,4 +726,8 @@ pub fn request_repaint() {
             let _ = windows::Win32::Graphics::Gdi::InvalidateRect(HWND(hwnd_val as *mut _), None, true);
         }
     }
+}
+
+pub fn is_panel_visible() -> bool {
+    PANEL_VISIBLE.lock().map(|v| *v).unwrap_or(false)
 }

@@ -184,7 +184,7 @@ unsafe extern "system" fn wnd_proc(
                         }
                     }
                 } else if mouse_msg == WM_LBUTTONUP {
-                    log_info!("Clic izquierdo en icono de bandeja: solicitando mostrar panel.");
+                    // Clic izquierdo en icono de bandeja reservado
                 }
                 return LRESULT(0);
             }
@@ -233,8 +233,9 @@ unsafe extern "system" fn wnd_proc(
                 return LRESULT(0);
             }
             WM_APP_THUMB_READY => {
-                log_info!("Notificación: miniatura lista en caché.");
-                panel::request_repaint();
+                if panel::is_panel_visible() {
+                    panel::request_repaint();
+                }
                 return LRESULT(0);
             }
             WM_APP_WATCHER_CHANGED => {
@@ -268,13 +269,21 @@ unsafe extern "system" fn wnd_proc(
                 let hwnd_val = hwnd.0 as isize;
                 let cache = state.thumb_cache.clone();
                 std::thread::spawn(move || {
-                    for path in images {
-                        crate::thumbs::request_thumbnail(
-                            windows::Win32::Foundation::HWND(hwnd_val as *mut _),
-                            &path,
-                            thumb_size,
-                            cache.clone(),
-                        );
+                    // Inicializar COM una sola vez para todo el lote de miniaturas del hilo
+                    unsafe {
+                        use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
+                        let hr = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+                        for path in images {
+                            crate::thumbs::request_thumbnail(
+                                windows::Win32::Foundation::HWND(hwnd_val as *mut _),
+                                &path,
+                                thumb_size,
+                                cache.clone(),
+                            );
+                        }
+                        if hr.is_ok() {
+                            CoUninitialize();
+                        }
                     }
                 });
                 return LRESULT(0);
@@ -474,7 +483,10 @@ impl App {
                     return Err(format!("Fallo al inicializar wallpaper: {e}"));
                 }
             };
-            // wallpaper_manager se mueve a AppState
+            if let Ok(current_wp) = wallpaper_manager.get_current_wallpaper() {
+                log_info!("Fondo de pantalla actual del sistema detectado: {:?}", current_wp);
+                crate::panel::set_current_wallpaper(&current_wp);
+            }
 
             let initial_fg = crate::winutil::get_current_foreground_window();
             log_info!("Evaluando ventana inicial en primer plano:");
@@ -491,8 +503,6 @@ impl App {
                 log_warn!("Carpeta de wallpapers no existe: {:?}", config.wallpaper_dir);
             }
 
-            // Timer periódico de medición de recursos (Fase 7)
-            let _ = windows::Win32::UI::WindowsAndMessaging::SetTimer(hwnd, RESOURCE_TIMER_ID, 5000, None);
 
             let config = Arc::new(Mutex::new(config));
             let mut state = Box::new(AppState {

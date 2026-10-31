@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, ReadDirectoryChangesW, FILE_ACTION_ADDED, FILE_ACTION_REMOVED, FILE_ACTION_RENAMED_NEW_NAME, FILE_ACTION_RENAMED_OLD_NAME, FILE_FLAG_BACKUP_SEMANTICS, FILE_LIST_DIRECTORY, FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_INFORMATION, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    CreateFileW, ReadDirectoryChangesW, FILE_ACTION_ADDED, FILE_ACTION_MODIFIED, FILE_ACTION_REMOVED, FILE_ACTION_RENAMED_NEW_NAME, FILE_ACTION_RENAMED_OLD_NAME, FILE_FLAG_BACKUP_SEMANTICS, FILE_LIST_DIRECTORY, FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_INFORMATION, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
 use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
 
@@ -81,7 +81,11 @@ impl DirectoryWatcher {
 
                 log_info!("Vigilancia de directorio iniciada: {:?}", folder);
 
-                let mut buffer = [0u8; 4096];
+                // ReadDirectoryChangesW requiere que el búfer receptor esté alineado a DWORD (4 bytes)
+                #[repr(C, align(4))]
+                struct AlignedBuffer([u8; 4096]);
+                let mut buffer = AlignedBuffer([0u8; 4096]);
+
                 loop {
                     if stop_clone.load(Ordering::Relaxed) {
                         break;
@@ -93,8 +97,8 @@ impl DirectoryWatcher {
 
                     let res = ReadDirectoryChangesW(
                         dir_handle,
-                        buffer.as_mut_ptr() as *mut _,
-                        buffer.len() as u32,
+                        buffer.0.as_mut_ptr() as *mut _,
+                        buffer.0.len() as u32,
                         subtree,
                         filter,
                         Some(&mut bytes_returned),
@@ -114,9 +118,14 @@ impl DirectoryWatcher {
                     let mut notify_change = false;
                     let mut offset: usize = 0;
                     while offset < bytes_returned as usize {
-                        let info = &*(buffer.as_ptr().add(offset) as *const FILE_NOTIFY_INFORMATION);
+                        let info = &*(buffer.0.as_ptr().add(offset) as *const FILE_NOTIFY_INFORMATION);
                         let action = info.Action;
-                        if action == FILE_ACTION_ADDED || action == FILE_ACTION_REMOVED || action == FILE_ACTION_RENAMED_NEW_NAME || action == FILE_ACTION_RENAMED_OLD_NAME {
+                        if action == FILE_ACTION_ADDED
+                            || action == FILE_ACTION_MODIFIED
+                            || action == FILE_ACTION_REMOVED
+                            || action == FILE_ACTION_RENAMED_NEW_NAME
+                            || action == FILE_ACTION_RENAMED_OLD_NAME
+                        {
                             let name_len = (info.FileNameLength as usize) / 2;
                             let name_slice = std::slice::from_raw_parts(info.FileName.as_ptr(), name_len);
                             let name = String::from_utf16_lossy(name_slice);

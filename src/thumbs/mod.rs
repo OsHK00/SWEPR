@@ -40,7 +40,16 @@ impl ThumbnailCache {
 
     pub fn insert(&self, thumb: Thumb) {
         if let Ok(mut guard) = self.cache.lock() {
-            guard.insert(thumb.path_key.clone(), thumb);
+            if let Some(old) = guard.insert(thumb.path_key.clone(), thumb) {
+                // Liberar el bitmap GDI sustituido para evitar fugas de memoria GDI
+                unsafe {
+                    if old.hbitmap != 0 {
+                        let _ = windows::Win32::Graphics::Gdi::DeleteObject(
+                            windows::Win32::Graphics::Gdi::HGDIOBJ(old.hbitmap as *mut _),
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -85,7 +94,9 @@ pub fn request_thumbnail<P: AsRef<Path>>(hwnd: HWND, path: P, size_px: i32, cach
     let start = std::time::Instant::now();
     unsafe {
         let hr = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-        let should_uninit = hr.is_ok();
+        // Solo desinicializar COM si esta llamada lo inicializó (hr == S_OK, 0).
+        // Si ya estaba inicializado (S_FALSE, 1), el hilo superior gestiona la desinicialización.
+        let should_uninit = hr.0 == 0;
 
         let path_wide: Vec<u16> = path_buf
             .to_string_lossy()
@@ -108,8 +119,8 @@ pub fn request_thumbnail<P: AsRef<Path>>(hwnd: HWND, path: P, size_px: i32, cach
                                 "Miniatura generada para {:?} en {} ms ({}x{})",
                                 path_buf.file_name().unwrap_or_default(),
                                 elapsed,
-                                size_px,
-                                size_px
+                                thumb_w,
+                                thumb_h
                             );
                             let thumb = Thumb {
                                 path_key: key.clone(),
