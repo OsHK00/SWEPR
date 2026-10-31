@@ -22,6 +22,8 @@ pub struct AppConfig {
     pub panel_side: PanelSide,
     #[serde(default = "default_show_scrollbar")]
     pub show_scrollbar: bool,
+    #[serde(default = "default_panel_margin")]
+    pub panel_margin: u32,
     #[serde(default = "default_language")]
     pub language: String,
     #[serde(default)]
@@ -29,6 +31,7 @@ pub struct AppConfig {
 }
 
 fn default_show_scrollbar() -> bool { true }
+fn default_panel_margin() -> u32 { 16 }
 fn default_language() -> String { "auto".to_string() }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -109,6 +112,7 @@ impl Default for AppConfig {
             zones: ZoneConfig::default(),
             panel_side: PanelSide::Top,
             show_scrollbar: true,
+            panel_margin: default_panel_margin(),
             language: default_language(),
             hotkeys: HotkeyConfig::default(),
         }
@@ -154,6 +158,10 @@ impl AppConfig {
                         .ok()
                         .and_then(|value| value.get("show_scrollbar").cloned())
                         .is_some();
+                    let has_panel_margin = serde_json::from_str::<serde_json::Value>(&contents)
+                        .ok()
+                        .and_then(|value| value.get("panel_margin").cloned())
+                        .is_some();
                     let has_language = serde_json::from_str::<serde_json::Value>(&contents)
                         .ok()
                         .and_then(|value| value.get("language").cloned())
@@ -162,7 +170,7 @@ impl AppConfig {
                         .ok()
                         .map(|value| value.get("acrylic_enabled").is_some() || value.get("acrylic_opacity").is_some())
                         .unwrap_or(false);
-                    if !has_all_hotkeys || !has_panel_side || !has_show_scrollbar || !has_language || has_legacy_acrylic || zones_changed {
+                    if !has_all_hotkeys || !has_panel_side || !has_show_scrollbar || !has_panel_margin || !has_language || has_legacy_acrylic || zones_changed {
                         let _ = config.save();
                     }
                     log_info!("Configuración general cargada desde {:?}", path);

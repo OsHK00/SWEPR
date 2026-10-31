@@ -26,6 +26,7 @@ const HOTKEY_CLICK_CHECK_MS: u32 = 10;
 const THUMB_W: i32 = 160;
 const THUMB_H: i32 = 90;
 const THUMB_MARGIN: i32 = 8;
+const CLOSE_GRACE_PX: i32 = 12;
 
 const HOVER_ANIM_TIMER_ID: usize = 8003;
 const HOVER_ANIM_STEP_MS: u32 = 16;
@@ -53,6 +54,7 @@ static PANEL_EXITING: Mutex<bool> = Mutex::new(false);
 static PANEL_CLOSE_ON_MOUSE_LEAVE: Mutex<bool> = Mutex::new(true);
 static PANEL_SIDE: Mutex<PanelSide> = Mutex::new(PanelSide::Top);
 static PANEL_SHOW_SCROLLBAR: Mutex<bool> = Mutex::new(true);
+static PANEL_MARGIN: Mutex<u32> = Mutex::new(0);
 static PANEL_HINSTANCE: Mutex<Option<isize>> = Mutex::new(None);
 static PANEL_CLASS: Mutex<Option<Vec<u16>>> = Mutex::new(None);
 static PANEL_X: Mutex<i32> = Mutex::new(0);
@@ -73,6 +75,15 @@ static PANEL_THUMB_SCALES: Mutex<Vec<f32>> = Mutex::new(Vec::new());
 static PANEL_THUMB_TARGETS: Mutex<Vec<f32>> = Mutex::new(Vec::new());
 static PANEL_THUMB_ANIM: Mutex<bool> = Mutex::new(false);
 static PANEL_CURRENT_WALLPAPER: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
+
+fn effective_panel_margin(side: PanelSide, requested: u32, monitor_width: i32, monitor_height: i32) -> i32 {
+    let requested = requested.min(i32::MAX as u32) as i32;
+    let max_margin = match side {
+        PanelSide::Top => monitor_height - (THUMB_H + THUMB_MARGIN * 2 + 3),
+        PanelSide::Left | PanelSide::Right => monitor_width - (THUMB_W + THUMB_MARGIN * 2 + 3),
+    };
+    requested.min(max_margin.max(0))
+}
 
 fn thumbnail_content_extent(count: usize, vertical: bool) -> i32 {
     if count == 0 { return 0; }
@@ -194,8 +205,37 @@ unsafe extern "system" fn panel_wnd_proc(
                 let _ = GetCursorPos(&mut pt);
                 let mut rect = RECT::default();
                 let _ = GetWindowRect(hwnd, &mut rect);
-                let outside = pt.x < rect.left || pt.x >= rect.right || pt.y < rect.top || pt.y >= rect.bottom;
                 let close_on_leave = PANEL_CLOSE_ON_MOUSE_LEAVE.lock().map(|value| *value).unwrap_or(true);
+                let mut inside = pt.x >= rect.left && pt.x < rect.right && pt.y >= rect.top && pt.y < rect.bottom;
+                if close_on_leave && !inside {
+                    let side = PANEL_SIDE.lock().map(|value| *value).unwrap_or(PanelSide::Top);
+                    let hmon = windows::Win32::Graphics::Gdi::MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+                    let mut monitor = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+                    let _ = GetMonitorInfoW(hmon, &mut monitor);
+                    let margin = PANEL_MARGIN.lock().map(|value| *value).unwrap_or(0);
+                    let monitor_width = monitor.rcMonitor.right - monitor.rcMonitor.left;
+                    let monitor_height = monitor.rcMonitor.bottom - monitor.rcMonitor.top;
+                    let margin = effective_panel_margin(side, margin, monitor_width, monitor_height);
+                    let grace = margin.saturating_add(CLOSE_GRACE_PX);
+                    inside = match side {
+                        PanelSide::Top => {
+                            pt.x >= rect.left && pt.x < rect.right
+                                && pt.y >= monitor.rcMonitor.top
+                                && pt.y < (monitor.rcMonitor.top + grace).min(monitor.rcMonitor.bottom)
+                        }
+                        PanelSide::Left => {
+                            pt.y >= monitor.rcMonitor.top && pt.y < monitor.rcMonitor.bottom
+                                && pt.x >= monitor.rcMonitor.left
+                                && pt.x < (monitor.rcMonitor.left + grace).min(monitor.rcMonitor.right)
+                        }
+                        PanelSide::Right => {
+                            pt.y >= monitor.rcMonitor.top && pt.y < monitor.rcMonitor.bottom
+                                && pt.x >= (monitor.rcMonitor.right - grace).max(monitor.rcMonitor.left)
+                                && pt.x < monitor.rcMonitor.right
+                        }
+                    };
+                }
+                let outside = !inside;
                 let left_button_down = windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(
                     windows::Win32::UI::Input::KeyboardAndMouse::VK_LBUTTON.0 as i32,
                 ) < 0;
@@ -632,6 +672,10 @@ pub fn set_scrollbar_visible(visible: bool) {
     request_repaint();
 }
 
+pub fn set_panel_margin(margin: u32) {
+    if let Ok(mut current) = PANEL_MARGIN.lock() { *current = margin; }
+}
+
 fn show_panel_with_close_on_mouse_leave(close_on_mouse_leave: bool) {
     unsafe {
         if let Ok(v) = PANEL_VISIBLE.lock() {
@@ -652,19 +696,22 @@ fn show_panel_with_close_on_mouse_leave(close_on_mouse_leave: bool) {
         let _ = GetMonitorInfoW(hmon, &mut mi);
 
         let side = PANEL_SIDE.lock().map(|value| *value).unwrap_or(PanelSide::Top);
-        let work_width = mi.rcWork.right - mi.rcWork.left;
-        let work_height = mi.rcWork.bottom - mi.rcWork.top;
         let vertical = side != PanelSide::Top;
-        let width = if vertical { THUMB_W + THUMB_MARGIN * 2 + 3 } else { work_width.max(THUMB_W + THUMB_MARGIN * 2) };
-        let height = if vertical { work_height } else { THUMB_H + THUMB_MARGIN * 2 + 3 };
+        let monitor_width = mi.rcMonitor.right - mi.rcMonitor.left;
+        let monitor_height = mi.rcMonitor.bottom - mi.rcMonitor.top;
+        let requested_margin = PANEL_MARGIN.lock().map(|margin| *margin).unwrap_or(0);
+        let margin = effective_panel_margin(side, requested_margin, monitor_width, monitor_height);
+        let width = if vertical { THUMB_W + THUMB_MARGIN * 2 + 3 } else { monitor_width };
+        let height = if vertical { monitor_height } else { THUMB_H + THUMB_MARGIN * 2 + 3 };
         let target_x = match side {
-            PanelSide::Top => mi.rcWork.left,
-            PanelSide::Left => mi.rcMonitor.left,
-            PanelSide::Right => mi.rcMonitor.right - width,
+            PanelSide::Top => mi.rcMonitor.left,
+            PanelSide::Left => mi.rcMonitor.left + margin,
+            PanelSide::Right => mi.rcMonitor.right - width - margin,
         };
-        let target_y = if vertical { mi.rcWork.top } else { mi.rcMonitor.top };
+        let target_y = if side == PanelSide::Top { mi.rcMonitor.top + margin } else { mi.rcMonitor.top };
         let start_x = match side {
             PanelSide::Left => mi.rcMonitor.left - width,
+            PanelSide::Right => mi.rcMonitor.right,
             _ => target_x,
         };
         let start_y = if side == PanelSide::Top { mi.rcMonitor.top - height } else { target_y };

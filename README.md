@@ -1,10 +1,10 @@
+<div align="center">
+    <img src="resources/logo.png" title="SWEPR" alt="SWEPR logo" width="256" />
+    <h1>SWEPR</h1>
+    <p>A lightweight Windows desktop wallpaper selector.</p>
+</div>
 
-
-![SWEPR logo](resources/logo.png)
-
-# SWEPR
-
-SWEPR is a lightweight Windows desktop wallpaper selector. It runs in the system tray and lets you browse a folder of images, preview them in a thumbnail panel, and apply a wallpaper without opening a separate desktop app.
+SWEPR runs in the system tray and lets you browse a folder of images, preview them in a thumbnail panel, and apply a wallpaper without opening a separate desktop app.
 
 ## Features
 

@@ -391,7 +391,7 @@ unsafe extern "system" fn wnd_proc(
                 log_info!("Configuración cambiada, limpiando caché y reescaneando...");
                 // Limpiar caché de miniaturas
                 state.thumb_cache.clear();
-                let (by_date, wallpaper_dir, scan_subfolders, detection_enabled, panel_side, show_scrollbar, language, mut zones) = {
+                let (by_date, wallpaper_dir, scan_subfolders, detection_enabled, panel_side, show_scrollbar, panel_margin, language, mut zones) = {
                     let config = state.config.lock().unwrap();
                     (
                         config.sort_by.eq_ignore_ascii_case("date"),
@@ -400,6 +400,7 @@ unsafe extern "system" fn wnd_proc(
                         config.detection_enabled,
                         config.panel_side,
                         config.show_scrollbar,
+                        config.panel_margin,
                         config.language.clone(),
                         config.zones.clone(),
                     )
@@ -408,6 +409,7 @@ unsafe extern "system" fn wnd_proc(
                 crate::i18n::set_language(language);
                 panel::set_panel_side(panel_side);
                 panel::set_scrollbar_visible(show_scrollbar);
+                panel::set_panel_margin(panel_margin);
                 state.zone_detector.update_config(zones);
                 state.scanner.scan_folder(
                     hwnd,
@@ -529,6 +531,7 @@ impl App {
         crate::i18n::set_language(config.language.clone());
         panel::set_panel_side(config.panel_side);
         panel::set_scrollbar_visible(config.show_scrollbar);
+        panel::set_panel_margin(config.panel_margin);
 
         if let Err(e) = crate::config::autostart::set_autostart(config.autostart) {
             crate::log_warn!("Fallo al sincronizar autoarranque inicial: {e}");
