@@ -107,3 +107,8 @@ To create a GitHub-ready ZIP for version 1.0.0, run this from the repository roo
 ```
 
 The package is written to `releases\v1.0.0\SWEPR-v1.0.0-windows-x64.zip`. To create a different version, use `.\prepare-release.ps1 -Version 1.1.0`.
+
+
+## License
+
+SWEPR is licensed under the GNU General Public License v3.0 only. See [LICENSE](LICENSE) for the full terms.

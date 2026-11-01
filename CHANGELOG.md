@@ -1,8 +1,6 @@
 # Changelog
 
-This file tracks user-facing changes between releases. Commits do not imply a new release. Move the relevant entries from `Unreleased` into a version section when preparing a release.
-
-## Unreleased
+This file tracks user-facing changes between releases. Commits do not imply a new release.
 
 ### Added
 
