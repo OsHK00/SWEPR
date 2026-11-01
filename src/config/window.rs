@@ -2,12 +2,14 @@ use crate::config::{AppConfig, PanelSide};
 use crate::log_info;
 use crate::winutil::{as_pcwstr, to_wide_chars};
 use std::sync::{Arc, Mutex};
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{BOOL, COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::Graphics::Gdi::{CreateSolidBrush, FillRect, HBRUSH, HDC, SetBkColor, SetBkMode, SetTextColor, OPAQUE, TRANSPARENT};
+use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassW,
-    CS_HREDRAW, CS_VREDRAW, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WS_CAPTION, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU, WS_VISIBLE,
-    GetDlgItem, SendMessageW, SetWindowTextW,
+    CS_HREDRAW, CS_VREDRAW, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WS_CAPTION, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU,
+    GetDlgItem, SendMessageW, SetWindowTextW, ShowWindow, SW_SHOW,
 };
 
 const CONFIG_CLASS_NAME: &str = "SWEPR_ConfigWindowClass";
@@ -27,17 +29,97 @@ const IDC_THUMB_CHK_512: i32 = 1013;
 const IDC_PANEL_SIDE_COMBO: i32 = 1014;
 const IDC_SCROLLBAR_CHK: i32 = 1015;
 const IDC_LANGUAGE_COMBO: i32 = 1016;
+const IDC_SECTION_GENERAL: i32 = 1017;
+const IDC_SECTION_PANEL: i32 = 1018;
+const IDC_SECTION_THUMBNAILS: i32 = 1019;
+const IDC_SECTION_FOLDER: i32 = 1020;
 
 static CONFIG_HWND: Mutex<Option<isize>> = Mutex::new(None);
 static CONFIG_STATE: Mutex<Option<Arc<Mutex<AppConfig>>>> = Mutex::new(None);
 static PENDING_FOLDER_PATH: Mutex<Option<String>> = Mutex::new(None);
 static LANGUAGE_OPTIONS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+static CONFIG_BG_BRUSH: Mutex<Option<isize>> = Mutex::new(None);
+static CONFIG_FIELD_BRUSH: Mutex<Option<isize>> = Mutex::new(None);
 
 fn hmenu(id: i32) -> windows::Win32::UI::WindowsAndMessaging::HMENU {
     windows::Win32::UI::WindowsAndMessaging::HMENU(id as *mut _)
 }
 
 fn tr(key: &str) -> Vec<u16> { to_wide_chars(&crate::i18n::t(key)) }
+
+unsafe fn config_brush(field: bool) -> HBRUSH {
+    let storage = if field { &CONFIG_FIELD_BRUSH } else { &CONFIG_BG_BRUSH };
+    if let Ok(mut stored) = storage.lock() {
+        if let Some(handle) = *stored { return HBRUSH(handle as *mut _); }
+        let color = if field { COLORREF(0x00383838) } else { COLORREF(0x00242424) };
+        let brush = CreateSolidBrush(color);
+        *stored = Some(brush.0 as isize);
+        brush
+    } else {
+        HBRUSH::default()
+    }
+}
+
+unsafe fn add_control(hwnd: HWND, class: &str, text: &[u16], id: i32, x: i32, y: i32, width: i32, height: i32, extra_style: u32) -> HWND {
+    let style = windows::Win32::UI::WindowsAndMessaging::WS_CHILD
+        | windows::Win32::UI::WindowsAndMessaging::WS_VISIBLE
+        | windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(extra_style);
+    CreateWindowExW(
+        windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(0),
+        as_pcwstr(&to_wide_chars(class)),
+        as_pcwstr(text),
+        style,
+        x, y, width, height, hwnd, hmenu(id), None, None,
+    ).unwrap_or_default()
+}
+
+unsafe fn create_config_controls(hwnd: HWND) {
+    const TAB_STOP: u32 = 0x0001_0000;
+    const AUTO_HORIZONTAL_SCROLL: u32 = 0x0080;
+    const CHECKBOX: u32 = 3;
+    const RADIO_BUTTON: u32 = 4;
+    const GROUP_BOX: u32 = 7;
+    const COMBO_STYLE: u32 = 3 | 0x0020_0000;
+
+    add_control(hwnd, "BUTTON", &tr("Wallpaper folder:"), IDC_SECTION_FOLDER, 12, 8, 620, 76, GROUP_BOX);
+    add_control(hwnd, "EDIT", &to_wide_chars(""), IDC_FOLDER_EDIT, 24, 40, 462, 28, TAB_STOP | AUTO_HORIZONTAL_SCROLL | 0x0080_0000);
+    add_control(hwnd, "BUTTON", &tr("Browse..."), IDC_FOLDER_BTN, 496, 40, 122, 28, TAB_STOP);
+
+    add_control(hwnd, "BUTTON", &tr("General"), IDC_SECTION_GENERAL, 12, 92, 620, 140, GROUP_BOX);
+    add_control(hwnd, "BUTTON", &tr("Detection enabled"), IDC_DETECTION_CHK, 24, 116, 286, 28, CHECKBOX | TAB_STOP);
+    add_control(hwnd, "BUTTON", &tr("Scan subfolders"), IDC_SUBFOLDERS_CHK, 24, 148, 286, 28, CHECKBOX | TAB_STOP);
+    add_control(hwnd, "BUTTON", &tr("Start with Windows"), IDC_AUTOSTART_CHK, 24, 180, 286, 28, CHECKBOX | TAB_STOP);
+    add_control(hwnd, "STATIC", &tr("Language:"), 0, 338, 112, 270, 18, 0);
+    let language_combo = add_control(hwnd, "COMBOBOX", &to_wide_chars(""), IDC_LANGUAGE_COMBO, 338, 134, 270, 130, COMBO_STYLE | TAB_STOP);
+    let mut options = vec!["auto".to_string()];
+    let automatic = tr("Automatic (Windows)");
+    let _ = SendMessageW(language_combo, windows::Win32::UI::WindowsAndMessaging::CB_ADDSTRING, WPARAM(0), LPARAM(automatic.as_ptr() as isize));
+    for (code, name) in crate::i18n::available_languages() {
+        let name = to_wide_chars(&name);
+        let _ = SendMessageW(language_combo, windows::Win32::UI::WindowsAndMessaging::CB_ADDSTRING, WPARAM(0), LPARAM(name.as_ptr() as isize));
+        options.push(code);
+    }
+    if let Ok(mut stored) = LANGUAGE_OPTIONS.lock() { *stored = options; }
+
+    add_control(hwnd, "BUTTON", &tr("Thumbnail panel"), IDC_SECTION_PANEL, 12, 240, 620, 100, GROUP_BOX);
+    add_control(hwnd, "STATIC", &tr("Thumbnail panel position:"), 0, 24, 260, 270, 18, 0);
+    let panel_combo = add_control(hwnd, "COMBOBOX", &to_wide_chars(""), IDC_PANEL_SIDE_COMBO, 24, 281, 270, 100, COMBO_STYLE | TAB_STOP);
+    for item in ["Top", "Left", "Right"] {
+        let item = tr(item);
+        let _ = SendMessageW(panel_combo, windows::Win32::UI::WindowsAndMessaging::CB_ADDSTRING, WPARAM(0), LPARAM(item.as_ptr() as isize));
+    }
+    add_control(hwnd, "BUTTON", &tr("Show scrollbar"), IDC_SCROLLBAR_CHK, 338, 281, 270, 28, CHECKBOX | TAB_STOP);
+
+    add_control(hwnd, "BUTTON", &tr("Thumbnail size"), IDC_SECTION_THUMBNAILS, 12, 348, 620, 142, GROUP_BOX);
+    add_control(hwnd, "BUTTON", &tr("Small (64 px)"), IDC_THUMB_CHK_64, 24, 378, 280, 30, RADIO_BUTTON | TAB_STOP);
+    add_control(hwnd, "BUTTON", &tr("Standard (128 px)"), IDC_THUMB_CHK_128, 318, 378, 290, 30, RADIO_BUTTON | TAB_STOP);
+    add_control(hwnd, "BUTTON", &tr("Large (256 px)"), IDC_THUMB_CHK_256, 24, 416, 280, 30, RADIO_BUTTON | TAB_STOP);
+    add_control(hwnd, "BUTTON", &tr("Maximum (512 px)"), IDC_THUMB_CHK_512, 318, 416, 290, 30, RADIO_BUTTON | TAB_STOP);
+
+    add_control(hwnd, "STATIC", &tr("Smaller thumbnails use less memory. Changes apply after saving."), 0, 24, 496, 580, 20, 0);
+    add_control(hwnd, "BUTTON", &tr("Cancel"), IDC_CANCEL_BTN, 410, 530, 96, 32, TAB_STOP);
+    add_control(hwnd, "BUTTON", &tr("Save"), IDC_APPLY_BTN, 518, 530, 96, 32, TAB_STOP | 1);
+}
 
 /// Marca exclusivamente un radio de miniatura (BS_RADIOBUTTON) como seleccionado.
 unsafe fn set_thumb_radio_checked(hwnd: HWND, checked_id: i32, checked: bool) {
@@ -63,6 +145,30 @@ unsafe extern "system" fn config_wnd_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     match msg {
+        _ if msg == windows::Win32::UI::WindowsAndMessaging::WM_ERASEBKGND => {
+            let dc = HDC(wparam.0 as *mut _);
+            let mut rect = windows::Win32::Foundation::RECT::default();
+            let _ = windows::Win32::UI::WindowsAndMessaging::GetClientRect(hwnd, &mut rect);
+            let _ = FillRect(dc, &rect, config_brush(false));
+            LRESULT(1)
+        }
+        _ if msg == windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORSTATIC
+            || msg == windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORBTN =>
+        {
+            let dc = HDC(wparam.0 as *mut _);
+            let _ = SetTextColor(dc, COLORREF(0x00F0F0F0));
+            let _ = SetBkMode(dc, TRANSPARENT);
+            LRESULT(config_brush(false).0 as isize)
+        }
+        _ if msg == windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLOREDIT
+            || msg == windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORLISTBOX =>
+        {
+            let dc = HDC(wparam.0 as *mut _);
+            let _ = SetTextColor(dc, COLORREF(0x00F0F0F0));
+            let _ = SetBkColor(dc, COLORREF(0x00383838));
+            let _ = SetBkMode(dc, OPAQUE);
+            LRESULT(config_brush(true).0 as isize)
+        }
         _ if msg == windows::Win32::UI::WindowsAndMessaging::WM_USER + 100 => {
             // Actualizar el edit con la ruta seleccionada (sin usar puntero colgante)
             if let Ok(mut g) = PENDING_FOLDER_PATH.lock() {
@@ -79,201 +185,7 @@ unsafe extern "system" fn config_wnd_proc(
         }
         WM_CREATE => {
             log_info!("Ventana de configuración creada");
-            let x = 20i32;
-            let mut y = 20i32;
-            let w = 440i32;
-            let h = 24i32;
-
-            // Carpeta label
-            let _ = CreateWindowExW(
-                windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(0),
-                as_pcwstr(&to_wide_chars("STATIC")),
-                as_pcwstr(&tr("Wallpaper folder:")),
-                windows::Win32::UI::WindowsAndMessaging::WS_CHILD | windows::Win32::UI::WindowsAndMessaging::WS_VISIBLE,
-                x, y, w, 16, hwnd, windows::Win32::UI::WindowsAndMessaging::HMENU(std::ptr::null_mut()), None, None,
-            );
-            y += 20;
-            let _ = CreateWindowExW(
-                windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(0),
-                as_pcwstr(&to_wide_chars("EDIT")),
-                as_pcwstr(&to_wide_chars("")),
-                windows::Win32::UI::WindowsAndMessaging::WS_CHILD | windows::Win32::UI::WindowsAndMessaging::WS_VISIBLE | windows::Win32::UI::WindowsAndMessaging::WS_BORDER,
-                x, y, w - 80, h, hwnd, hmenu(IDC_FOLDER_EDIT), None, None,
-            );
-            let _ = CreateWindowExW(
-                windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(0),
-                as_pcwstr(&to_wide_chars("BUTTON")),
-                as_pcwstr(&tr("Browse...")),
-                windows::Win32::UI::WindowsAndMessaging::WS_CHILD | windows::Win32::UI::WindowsAndMessaging::WS_VISIBLE ,
-                x + w - 70, y, 70, h, hwnd, hmenu(IDC_FOLDER_BTN), None, None,
-            );
-            y += 35;
-
-            let _ = CreateWindowExW(
-                windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(0),
-                as_pcwstr(&to_wide_chars("STATIC")),
-                as_pcwstr(&tr("Language:")),
-                windows::Win32::UI::WindowsAndMessaging::WS_CHILD | windows::Win32::UI::WindowsAndMessaging::WS_VISIBLE,
-                x, y, w, 16, hwnd, windows::Win32::UI::WindowsAndMessaging::HMENU(std::ptr::null_mut()), None, None,
-            );
-            y += 20;
-            let language_combo = CreateWindowExW(
-                windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(0),
-                as_pcwstr(&to_wide_chars("COMBOBOX")),
-                as_pcwstr(&to_wide_chars("")),
-                windows::Win32::UI::WindowsAndMessaging::WS_CHILD
-                    | windows::Win32::UI::WindowsAndMessaging::WS_VISIBLE
-                    | windows::Win32::UI::WindowsAndMessaging::WS_VSCROLL
-                    | windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(3),
-                x, y, 220, 120, hwnd, hmenu(IDC_LANGUAGE_COMBO), None, None,
-            );
-            if let Ok(combo) = language_combo {
-                let mut options = vec!["auto".to_string()];
-                let automatic = tr("Automatic (Windows)");
-                let _ = SendMessageW(combo, windows::Win32::UI::WindowsAndMessaging::CB_ADDSTRING, WPARAM(0), LPARAM(automatic.as_ptr() as isize));
-                for (code, name) in crate::i18n::available_languages() {
-                    let wide = to_wide_chars(&name);
-                    let _ = SendMessageW(combo, windows::Win32::UI::WindowsAndMessaging::CB_ADDSTRING, WPARAM(0), LPARAM(wide.as_ptr() as isize));
-                    options.push(code);
-                }
-                if let Ok(mut stored) = LANGUAGE_OPTIONS.lock() { *stored = options; }
-            }
-            y += 35;
-
-            // Detección activada
-            let _ = CreateWindowExW(
-                windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(0),
-                as_pcwstr(&to_wide_chars("BUTTON")),
-                as_pcwstr(&tr("Detection enabled")),
-                windows::Win32::UI::WindowsAndMessaging::WS_CHILD | windows::Win32::UI::WindowsAndMessaging::WS_VISIBLE | windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(3),
-                x, y, w, h, hwnd, hmenu(IDC_DETECTION_CHK), None, None,
-            );
-            y += 30;
-
-            // Subcarpetas
-            let _ = CreateWindowExW(
-                windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(0),
-                as_pcwstr(&to_wide_chars("BUTTON")),
-                as_pcwstr(&tr("Scan subfolders")),
-                windows::Win32::UI::WindowsAndMessaging::WS_CHILD | windows::Win32::UI::WindowsAndMessaging::WS_VISIBLE | windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(3),
-                x, y, w, h, hwnd, hmenu(IDC_SUBFOLDERS_CHK), None, None,
-            );
-            y += 30;
-
-            // Autoarranque
-            let _ = CreateWindowExW(
-                windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(0),
-                as_pcwstr(&to_wide_chars("BUTTON")),
-                as_pcwstr(&tr("Start with Windows")),
-                windows::Win32::UI::WindowsAndMessaging::WS_CHILD | windows::Win32::UI::WindowsAndMessaging::WS_VISIBLE | windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(3),
-                x, y, w, h, hwnd, hmenu(IDC_AUTOSTART_CHK), None, None,
-            );
-            y += 40;
-
-            let _ = CreateWindowExW(
-                windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(0),
-                as_pcwstr(&to_wide_chars("STATIC")),
-                as_pcwstr(&tr("Thumbnail panel position:")),
-                windows::Win32::UI::WindowsAndMessaging::WS_CHILD | windows::Win32::UI::WindowsAndMessaging::WS_VISIBLE,
-                x, y, w, 16, hwnd, windows::Win32::UI::WindowsAndMessaging::HMENU(std::ptr::null_mut()), None, None,
-            );
-            y += 20;
-            let combo = CreateWindowExW(
-                windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(0),
-                as_pcwstr(&to_wide_chars("COMBOBOX")),
-                as_pcwstr(&to_wide_chars("")),
-                windows::Win32::UI::WindowsAndMessaging::WS_CHILD
-                    | windows::Win32::UI::WindowsAndMessaging::WS_VISIBLE
-                    | windows::Win32::UI::WindowsAndMessaging::WS_VSCROLL
-                    | windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(3),
-                x, y, 220, 100, hwnd, hmenu(IDC_PANEL_SIDE_COMBO), None, None,
-            );
-            if let Ok(combo) = combo {
-                for item in ["Top", "Left", "Right"] {
-                    let wide = tr(item);
-                    let _ = SendMessageW(
-                        combo,
-                        windows::Win32::UI::WindowsAndMessaging::CB_ADDSTRING,
-                        WPARAM(0),
-                        LPARAM(wide.as_ptr() as isize),
-                    );
-                }
-            }
-            y += 35;
-            let _ = CreateWindowExW(
-                windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(0),
-                as_pcwstr(&to_wide_chars("BUTTON")),
-                as_pcwstr(&tr("Show scrollbar")),
-                windows::Win32::UI::WindowsAndMessaging::WS_CHILD
-                    | windows::Win32::UI::WindowsAndMessaging::WS_VISIBLE
-                    | windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(3),
-                x, y, w, h, hwnd, hmenu(IDC_SCROLLBAR_CHK), None, None,
-            );
-            y += 35;
-            // Calidad / Detalle de miniatura (grupo de radios)
-            let _ = CreateWindowExW(
-                windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(0),
-                as_pcwstr(&to_wide_chars("STATIC")),
-                as_pcwstr(&tr("Thumbnail quality (memory use):")),
-                windows::Win32::UI::WindowsAndMessaging::WS_CHILD | windows::Win32::UI::WindowsAndMessaging::WS_VISIBLE,
-                x, y, w, 16, hwnd, windows::Win32::UI::WindowsAndMessaging::HMENU(std::ptr::null_mut()), None, None,
-            );
-            y += 20;
-            let _ = CreateWindowExW(
-                windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(0),
-                as_pcwstr(&to_wide_chars("BUTTON")),
-                as_pcwstr(&tr("Small (64 px) — Lower memory use")),
-                windows::Win32::UI::WindowsAndMessaging::WS_CHILD | windows::Win32::UI::WindowsAndMessaging::WS_VISIBLE | windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(4),
-                x, y, w, 24, hwnd, hmenu(IDC_THUMB_CHK_64), None, None,
-            );
-            let _ = CreateWindowExW(
-                windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(0),
-                as_pcwstr(&to_wide_chars("BUTTON")),
-                as_pcwstr(&tr("Standard (128 px) — Recommended")),
-                windows::Win32::UI::WindowsAndMessaging::WS_CHILD | windows::Win32::UI::WindowsAndMessaging::WS_VISIBLE | windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(4),
-                x, y + 24, w, 24, hwnd, hmenu(IDC_THUMB_CHK_128), None, None,
-            );
-            let _ = CreateWindowExW(
-                windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(0),
-                as_pcwstr(&to_wide_chars("BUTTON")),
-                as_pcwstr(&tr("Large (256 px) — Sharper")),
-                windows::Win32::UI::WindowsAndMessaging::WS_CHILD | windows::Win32::UI::WindowsAndMessaging::WS_VISIBLE | windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(4),
-                x, y + 48, w, 24, hwnd, hmenu(IDC_THUMB_CHK_256), None, None,
-            );
-            let _ = CreateWindowExW(
-                windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(0),
-                as_pcwstr(&to_wide_chars("BUTTON")),
-                as_pcwstr(&tr("Very large (512 px) — Maximum detail")),
-                windows::Win32::UI::WindowsAndMessaging::WS_CHILD | windows::Win32::UI::WindowsAndMessaging::WS_VISIBLE | windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(4),
-                x, y + 72, w, 24, hwnd, hmenu(IDC_THUMB_CHK_512), None, None,
-            );
-            y += 110;
-
-            // Nota sobre guardado
-            let _ = CreateWindowExW(
-                windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(0),
-                as_pcwstr(&to_wide_chars("STATIC")),
-                as_pcwstr(&tr("Thumbnail quality changes apply after saving.")),
-                windows::Win32::UI::WindowsAndMessaging::WS_CHILD | windows::Win32::UI::WindowsAndMessaging::WS_VISIBLE,
-                x, y, w, 16, hwnd, windows::Win32::UI::WindowsAndMessaging::HMENU(std::ptr::null_mut()), None, None,
-            );
-            y += 24;
-
-            // Botones
-            let _ = CreateWindowExW(
-                windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(0),
-                as_pcwstr(&to_wide_chars("BUTTON")),
-                as_pcwstr(&tr("Save")),
-                windows::Win32::UI::WindowsAndMessaging::WS_CHILD | windows::Win32::UI::WindowsAndMessaging::WS_VISIBLE ,
-                x, y, 90, 30, hwnd, hmenu(IDC_APPLY_BTN), None, None,
-            );
-            let _ = CreateWindowExW(
-                windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(0),
-                as_pcwstr(&to_wide_chars("BUTTON")),
-                as_pcwstr(&tr("Cancel")),
-                windows::Win32::UI::WindowsAndMessaging::WS_CHILD | windows::Win32::UI::WindowsAndMessaging::WS_VISIBLE ,
-                x + 100, y, 90, 30, hwnd, hmenu(IDC_CANCEL_BTN), None, None,
-            );
+            create_config_controls(hwnd);
 
             // Cargar valores de config
             if let Some(config_arc) = CONFIG_STATE.lock().ok().and_then(|g| g.clone()) {
@@ -578,6 +490,7 @@ pub fn show_config_window(config: Arc<Mutex<AppConfig>>) {
             lpfnWndProc: Some(config_wnd_proc),
             hInstance: hinstance,
             hIcon: crate::resources::app_icon(),
+            hbrBackground: config_brush(false),
             lpszClassName: as_pcwstr(&class_name_wide),
             ..Default::default()
         };
@@ -590,15 +503,23 @@ pub fn show_config_window(config: Arc<Mutex<AppConfig>>) {
             windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(0),
             as_pcwstr(&class_name_wide),
             as_pcwstr(&tr("SWEPR - Settings")),
-            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_VISIBLE,
-            100, 100, 540, 640,
+            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+            100, 100, 660, 610,
             None, None, hinstance, None,
         ) {
             Ok(h) => h,
             Err(_) => return,
         };
 
+        let use_dark_titlebar = BOOL(1);
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_USE_IMMERSIVE_DARK_MODE,
+            &use_dark_titlebar as *const _ as *const std::ffi::c_void,
+            std::mem::size_of::<BOOL>() as u32,
+        );
         if let Ok(mut g) = CONFIG_HWND.lock() { *g = Some(hwnd.0 as isize); }
+        let _ = ShowWindow(hwnd, SW_SHOW);
         log_info!("Ventana de configuración mostrada");
     }
 }

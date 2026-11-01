@@ -16,6 +16,16 @@ SWEPR runs in the system tray and lets you browse a folder of images, preview th
 - Supports English and Spanish translations. The language can be selected in Settings; additional translation files can be added to the `languages` folder.
 - Offers settings for the wallpaper folder, subfolder scanning, Windows startup, panel position, scrollbar visibility, and thumbnail size.
 
+## Panel demos
+
+### Panel at the top
+
+![Demo of the thumbnail panel at the top of the screen](resources/demos/panel-top-demo.gif)
+
+### Changing the panel position
+
+![Demo of changing the panel position in Settings](resources/demos/panel-position-demo.gif)
+
 ## Using SWEPR
 
 Start SWEPR and open its context menu from the system tray to access Settings and other actions. Choose the folder containing your wallpapers in Settings. The gallery refreshes when files in the folder change.
@@ -45,7 +55,10 @@ Translation files are JSON files in `languages`, named with a language code such
 ├── resources/
 │   ├── logo.png             Project logo shown in this README
 │   ├── swepr.ico            Application icon for Windows
-│   └── swepr.rc             Windows icon resource definition
+│   ├── swepr.rc             Windows icon resource definition
+│   └── demos/               README demo GIFs
+│       ├── panel-top-demo.gif
+│       └── panel-position-demo.gif
 ├── src/
 │   ├── app.rs               Application startup, events, and coordination
 │   ├── config/
