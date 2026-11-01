@@ -71,7 +71,8 @@ Translation files are JSON files in `languages`, named with a language code such
 ├── app.manifest             Windows application manifest
 ├── build.rs                 Build-time Windows manifest setup
 ├── Cargo.toml               Rust package metadata and dependencies
-└── Cargo.lock               Locked Rust dependency versions
+├── Cargo.lock               Locked Rust dependency versions
+└── prepare-release.ps1      Builds and packages a GitHub-ready release ZIP
 ```
 
 ## Build
@@ -85,3 +86,11 @@ cargo build --release
 ```
 
 The executable is created at `target\release\swepr.exe`. Keep the `languages` folder beside the executable so translations can be loaded when distributing or moving the application.
+
+To create a GitHub-ready ZIP for version 1.0.0, run this from the repository root:
+
+```powershell
+.\prepare-release.ps1
+```
+
+The package is written to `releases\v1.0.0\SWEPR-v1.0.0-windows-x64.zip`. To create a different version, use `.\prepare-release.ps1 -Version 1.1.0`.
