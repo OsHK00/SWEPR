@@ -2,9 +2,14 @@
 
 This file tracks user-facing changes between releases. Commits do not imply a new release.
 
+## Unreleased
+
+### Improved
+
+- Redesigned the settings window with a dark theme, clearer grouping, and shorter thumbnail size labels.
+
 ### Added
 
-- No unreleased changes yet.
 
 ## [1.0.0]
 

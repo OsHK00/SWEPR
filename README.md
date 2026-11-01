@@ -1,6 +1,11 @@
 <div align="center">
     <img src="resources/logo.png" title="SWEPR" alt="SWEPR logo" width="256" />
     <h1>SWEPR</h1>
+    <p>
+        <img src="https://img.shields.io/badge/platform-Windows-0078D4?logo=windows&logoColor=white" alt="Windows" />
+        <img src="https://img.shields.io/badge/language-Rust-DEA584?logo=rust&logoColor=white" alt="Rust" />
+        <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0-blue.svg" alt="GPL-3.0 license" /></a>
+    </p>
     <p>A lightweight Windows desktop wallpaper selector.</p>
 </div>
 
