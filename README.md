@@ -16,10 +16,11 @@ SWEPR runs in the system tray and lets you browse a folder of images, preview th
 - Scans a wallpaper folder for JPG, JPEG, PNG, and BMP images, with optional subfolder scanning.
 - Opens a thumbnail panel from screen edge sensors or a keyboard shortcut. Two panel modes are available: Low power, a thumbnail strip at the top, left, or right edge of the screen, and Pro, a carousel of slanted cards in the center.
 - Highlights newly discovered images in green and places them at the beginning of the gallery.
-- Applies a selected wallpaper and lets you move through the collection with keyboard shortcuts.
+- Applies a selected wallpaper with the native Windows fade and lets you move through the collection with keyboard shortcuts. Navigation wraps around: after the last wallpaper comes the first one.
+- Keeps memory use low: thumbnails can be loaded all in advance or on demand, and Pro mode only loads the large cards that are on screen.
 - Provides tray menu actions for refreshing the gallery, opening the wallpaper folder, changing settings, and exiting.
 - Supports English and Spanish translations. The language can be selected in Settings; additional translation files can be added to the `languages` folder.
-- Offers settings for the wallpaper folder, subfolder scanning, Windows startup, panel mode, panel position, scrollbar visibility, and thumbnail size.
+- Offers a dark Settings window for the wallpaper folder, subfolder scanning, Windows startup, the wallpaper fade, panel mode, panel position, scrollbar visibility, thumbnail size and loading, and keyboard shortcuts.
 
 ## Panel demos
 
@@ -43,7 +44,7 @@ Default shortcuts:
 | `Ctrl` + `Alt` + `Left` | Apply the previous wallpaper |
 | `Ctrl` + `Alt` + `Right` | Apply the next wallpaper |
 
-Settings are stored at `%LOCALAPPDATA%\swepr\config.json`. Shortcut bindings can be customized there. The language defaults to the Windows display language, or can be selected from the Settings window.
+Shortcuts can be changed in Settings: click a field and press the new key combination, or press Backspace to turn that shortcut off. Combinations without `Ctrl`, `Alt`, or `Win` get `Ctrl` + `Alt` added, and changes apply as soon as you save. Settings are stored at `%LOCALAPPDATA%\swepr\config.json`. The language defaults to the Windows display language, or can be selected from the Settings window.
 
 ## Languages
 
@@ -69,6 +70,8 @@ Translation files are JSON files in `languages`, named with a language code such
 │   ├── config/
 │   │   ├── mod.rs           Settings model and JSON persistence
 │   │   ├── window.rs        Settings window
+│   │   ├── theme.rs         Dark drawing of the Settings controls
+│   │   ├── hotkey_field.rs  Field for capturing a keyboard shortcut
 │   │   └── autostart.rs     Windows startup registration
 │   ├── detector/
 │   │   ├── mod.rs           Detector coordination
@@ -77,12 +80,14 @@ Translation files are JSON files in `languages`, named with a language code such
 │   │   └── focus.rs         Desktop focus detection
 │   ├── i18n.rs              Loading and selection of translations
 │   ├── log.rs               Application logging
-│   ├── panel/mod.rs         Thumbnail panel and its interactions
+│   ├── panel/
+│   │   ├── mod.rs           Thumbnail panel (Low power strip) and its interactions
+│   │   └── carousel.rs      Pro mode carousel of slanted cards
 │   ├── resources.rs         Embedded application icon loader
 │   ├── scanner/mod.rs       Wallpaper folder scanning
 │   ├── thumbs/mod.rs        Thumbnail creation and cache
 │   ├── tray/mod.rs          System tray icon and context menu
-│   ├── wallpaper/mod.rs    Windows wallpaper operations
+│   ├── wallpaper/mod.rs     Windows wallpaper operations and fade
 │   ├── watcher/mod.rs       Wallpaper folder change monitoring
 │   ├── winutil/mod.rs       Shared Windows utility functions
 │   └── main.rs              Program entry point and module declarations

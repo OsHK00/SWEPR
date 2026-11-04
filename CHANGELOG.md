@@ -2,11 +2,11 @@
 
 This file tracks user-facing changes between releases. Commits do not imply a new release.
 
-## Unreleased
+## [1.1.0]
 
 ### Improved
 
-- Redesigned the settings window with a dark theme, clearer grouping, and shorter thumbnail size labels.
+- Redesigned the settings window: sections shown as cards with titles, dark drop-down lists, checkboxes and buttons drawn by SWEPR (with hover and pressed states), a highlighted Save button, and a title bar that matches the window. The thumbnail size is now a drop-down list, and the window is shorter so it fits on 1080p screens at 150% scaling.
 - The settings window uses the Windows interface font and scales with the display DPI; the thumbnail panel also scales with the DPI of its monitor.
 - Clearer thumbnail states: white outline for the focused wallpaper, blue outline for the current one, and a green dot for new ones.
 - The thumbnail panel only draws the visible thumbnails.
@@ -20,7 +20,9 @@ This file tracks user-facing changes between releases. Commits do not imply a ne
 - Panel mode setting: Low power (the thumbnail strip) or Pro, a carousel of slanted wallpaper cards in the middle of the screen with the focused card enlarged. Pro loads large cards only for the visible wallpapers and releases them 30 seconds after the panel closes.
 - A message in the panel when the wallpaper folder has no images.
 - Thumbnail loading setting: All in advance (default) or On demand, which keeps only thumbnails near the visible ones in memory (at most 200).
-
+- Keyboard shortcuts can be changed in Settings and apply as soon as you save, without restarting SWEPR. Shortcuts can use the Win key; combinations without Ctrl, Alt, or Win get Ctrl + Alt added, Backspace turns a shortcut off, and two shortcuts cannot share the same combination.
+- Panel navigation wraps around: after the last wallpaper comes the first one, and the other way around, with the arrow keys and with the mouse wheel.
+- Wallpaper changes use the native Windows fade (on by default; "Fade when changing wallpaper" in Settings). If the fade is unavailable, the wallpaper is applied instantly as before.
 
 ## [1.0.0]
 

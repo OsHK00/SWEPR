@@ -22,6 +22,9 @@ pub const WM_APP_GEN_THUMBS: u32 = windows::Win32::UI::WindowsAndMessaging::WM_A
 
 // WM_APP para notificar cambio de configuración
 pub const WM_APP_CONFIG_CHANGED: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 42;
+/// WPARAM 1: liberar los atajos globales (se están editando en la configuración);
+/// WPARAM 0: volver a registrarlos con la configuración guardada.
+pub const WM_APP_SUSPEND_HOTKEYS: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 43;
 
 /// En carga bajo demanda, miniaturas que se precargan a cada lado del fondo actual.
 const ON_DEMAND_PREFETCH: usize = 30;
@@ -81,44 +84,17 @@ const HOTKEY_PANEL_ID: i32 = 1;
 const HOTKEY_PREVIOUS_ID: i32 = 2;
 const HOTKEY_NEXT_ID: i32 = 3;
 
-fn virtual_key_code(name: &str) -> Option<u32> {
-    let normalized = name.trim().to_ascii_uppercase();
-    if normalized.len() == 1 {
-        let byte = normalized.as_bytes()[0];
-        if byte.is_ascii_alphanumeric() {
-            return Some(byte as u32);
-        }
-    }
-    match normalized.as_str() {
-        "LEFT" => Some(0x25),
-        "UP" => Some(0x26),
-        "RIGHT" => Some(0x27),
-        "DOWN" => Some(0x28),
-        "SPACE" => Some(0x20),
-        "ENTER" => Some(0x0D),
-        "TAB" => Some(0x09),
-        "ESC" | "ESCAPE" => Some(0x1B),
-        "BACKSPACE" => Some(0x08),
-        "HOME" => Some(0x24),
-        "END" => Some(0x23),
-        "PAGEUP" => Some(0x21),
-        "PAGEDOWN" => Some(0x22),
-        "INSERT" => Some(0x2D),
-        "DELETE" => Some(0x2E),
-        value if value.starts_with('F') => value[1..].parse::<u32>().ok()
-            .filter(|number| (1..=24).contains(number))
-            .map(|number| 0x70 + number - 1),
-        _ => None,
-    }
-}
-
 fn register_configured_hotkey(
     hwnd: HWND,
     id: i32,
     description: &str,
     binding: &crate::config::HotkeyBinding,
 ) {
-    let Some(key) = virtual_key_code(&binding.key) else {
+    if binding.is_empty() {
+        log_info!("Atajo {description} desactivado.");
+        return;
+    }
+    let Some(key) = crate::config::virtual_key_code(&binding.key) else {
         log_warn!("Atajo {description} omitido: tecla desconocida {:?}.", binding.key);
         return;
     };
@@ -142,6 +118,19 @@ fn register_configured_hotkey(
     } else {
         log_info!("Atajo registrado: {description} ({:?}+{})", binding.modifiers, binding.key);
     }
+}
+
+unsafe fn unregister_hotkeys(hwnd: HWND) {
+    let _ = UnregisterHotKey(hwnd, HOTKEY_PANEL_ID);
+    let _ = UnregisterHotKey(hwnd, HOTKEY_PREVIOUS_ID);
+    let _ = UnregisterHotKey(hwnd, HOTKEY_NEXT_ID);
+}
+
+fn register_hotkeys(hwnd: HWND, hotkeys: &crate::config::HotkeyConfig) {
+    unsafe { unregister_hotkeys(hwnd); }
+    register_configured_hotkey(hwnd, HOTKEY_PANEL_ID, "open_panel", &hotkeys.open_panel);
+    register_configured_hotkey(hwnd, HOTKEY_PREVIOUS_ID, "previous_wallpaper", &hotkeys.previous_wallpaper);
+    register_configured_hotkey(hwnd, HOTKEY_NEXT_ID, "next_wallpaper", &hotkeys.next_wallpaper);
 }
 
 pub struct AppState {
@@ -356,9 +345,12 @@ unsafe extern "system" fn wnd_proc(
                 // Aplicar wallpaper solicitado por el panel
                 if let Some(path) = PENDING_WALLPAPER_PATH.lock().ok().and_then(|mut g| g.take()) {
                     log_info!("Aplicando wallpaper desde panel: {:?}", path);
-                    let fit_mode = state.config.lock().unwrap().fit_mode.clone();
+                    let (fit_mode, fade) = {
+                        let config = state.config.lock().unwrap();
+                        (config.fit_mode.clone(), config.wallpaper_fade)
+                    };
                     let style = WallpaperStyle::from_str(&fit_mode);
-                    match state.wallpaper_manager.set_wallpaper(&path, None, style) {
+                    match state.wallpaper_manager.set_wallpaper(&path, None, style, fade) {
                         Ok(_) => {
                             log_info!("Wallpaper aplicado correctamente.");
                             if let Ok(mut images) = state.scanned_images.lock() {
@@ -396,6 +388,16 @@ unsafe extern "system" fn wnd_proc(
                     }
                 };
                 crate::thumbs::request_thumbnails(wanted.iter().map(|p| p.as_path()), thumb_size, &state.thumb_cache, hwnd);
+                return LRESULT(0);
+            }
+            WM_APP_SUSPEND_HOTKEYS => {
+                if wparam.0 == 1 {
+                    unregister_hotkeys(hwnd);
+                    log_info!("Atajos globales suspendidos mientras se editan.");
+                } else {
+                    let hotkeys = state.config.lock().unwrap().hotkeys.clone();
+                    register_hotkeys(hwnd, &hotkeys);
+                }
                 return LRESULT(0);
             }
             WM_APP_CONFIG_CHANGED => {
@@ -520,9 +522,7 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         WM_DESTROY => {
-            let _ = UnregisterHotKey(hwnd, HOTKEY_PANEL_ID);
-            let _ = UnregisterHotKey(hwnd, HOTKEY_PREVIOUS_ID);
-            let _ = UnregisterHotKey(hwnd, HOTKEY_NEXT_ID);
+            unregister_hotkeys(hwnd);
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
             PostQuitMessage(0);
             LRESULT(0)
@@ -593,9 +593,7 @@ impl App {
             crate::app::set_main_hwnd(hwnd);
             log_info!("Ventana principal creada con éxito. HWND: {:?}", hwnd);
 
-            register_configured_hotkey(hwnd, HOTKEY_PANEL_ID, "open_panel", &config.hotkeys.open_panel);
-            register_configured_hotkey(hwnd, HOTKEY_PREVIOUS_ID, "previous_wallpaper", &config.hotkeys.previous_wallpaper);
-            register_configured_hotkey(hwnd, HOTKEY_NEXT_ID, "next_wallpaper", &config.hotkeys.next_wallpaper);
+            register_hotkeys(hwnd, &config.hotkeys);
 
             // Registro del mensaje TaskbarCreated para reaccionar al reinicio de explorer.exe
             let taskbar_name = to_wide_chars("TaskbarCreated");

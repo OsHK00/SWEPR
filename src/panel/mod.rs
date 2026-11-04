@@ -160,6 +160,30 @@ fn thumbnail_at(x: i32, y: i32) -> Option<usize> {
     })
 }
 
+/// Índice siguiente o anterior con vuelta: tras la última viene la primera y al revés.
+fn wrapped_step(sel: usize, count: usize, forward: bool) -> usize {
+    if forward { (sel + 1) % count } else { (sel + count - 1) % count }
+}
+
+/// Mueve la selección una posición con vuelta al principio/final.
+fn step_selection(hwnd: HWND, forward: bool) {
+    let count = image_count();
+    if count == 0 { return; }
+    let sel = PANEL_SELECTED_INDEX.lock().ok().and_then(|g| *g).unwrap_or(0).min(count - 1);
+    let next = wrapped_step(sel, count, forward);
+    let wrapped = if forward { next < sel } else { next > sel };
+    if wrapped {
+        if let Some(layout) = carousel::layout().filter(|_| is_carousel()) {
+            // Al dar la vuelta, la animación empieza a una tarjeta del destino en vez de recorrer
+            // todo el carrusel (lo que además pediría las tarjetas de todo el recorrido).
+            let target = layout.center_scroll(next, count, viewport());
+            let start = if forward { target - layout.pitch() } else { target + layout.pitch() };
+            if let Ok(mut g) = PANEL_SCROLL_OFFSET.lock() { *g = start; }
+        }
+    }
+    select_index(hwnd, next);
+}
+
 /// Selecciona una miniatura y desplaza la vista para que se vea (centrada en el carrusel).
 fn select_index(hwnd: HWND, sel: usize) {
     if let Ok(mut g) = PANEL_SELECTED_INDEX.lock() { *g = Some(sel); }
@@ -711,19 +735,20 @@ unsafe extern "system" fn panel_wnd_proc(
             let delta = (wparam.0 >> 16) as i16 as i32;
             if is_carousel() {
                 // En el carrusel cada paso de la rueda avanza una tarjeta.
-                let count = image_count();
-                if count > 0 {
-                    let sel = PANEL_SELECTED_INDEX.lock().ok().and_then(|g| *g).unwrap_or(0);
-                    let sel = if delta > 0 { sel.saturating_sub(1) } else { (sel + 1).min(count - 1) };
-                    select_index(hwnd, sel);
-                }
+                step_selection(hwnd, delta < 0);
                 return LRESULT(0);
             }
             let scroll_delta = if delta > 0 { -30 } else { 30 };
             let max_scroll = max_scroll(image_count());
             if let Ok(mut g) = PANEL_SCROLL_OFFSET.lock() {
-                // Clamp: no se puede scrollear más allá del final de las imágenes
-                *g = (*g + scroll_delta).max(0).min(max_scroll);
+                // Al seguir girando en un extremo se salta al otro.
+                *g = if max_scroll > 0 && *g >= max_scroll && scroll_delta > 0 {
+                    0
+                } else if max_scroll > 0 && *g <= 0 && scroll_delta < 0 {
+                    max_scroll
+                } else {
+                    (*g + scroll_delta).max(0).min(max_scroll)
+                };
             }
             request_repaint();
             LRESULT(0)
@@ -741,10 +766,8 @@ unsafe extern "system" fn panel_wnd_proc(
                 let count = image_count();
                 if count == 0 { return LRESULT(0); }
                 let sel = PANEL_SELECTED_INDEX.lock().ok().and_then(|g| *g).unwrap_or(0);
-                if key == previous_key {
-                    select_index(hwnd, sel.saturating_sub(1));
-                } else if key == next_key {
-                    select_index(hwnd, (sel + 1).min(count - 1));
+                if key == previous_key || key == next_key {
+                    step_selection(hwnd, key == next_key);
                 } else { // Enter -> aplicar y cerrar panel
                     let path = PANEL_SCANNED.lock().ok().and_then(|g| g.clone())
                         .and_then(|arc| arc.lock().ok().and_then(|v| v.get(sel).map(|img| img.path.clone())));
@@ -1173,6 +1196,15 @@ pub(crate) unsafe fn save_bmp(dc: windows::Win32::Graphics::Gdi::HDC, bmp: windo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wrapped_step_loops_around() {
+        assert_eq!(wrapped_step(4, 5, true), 0);
+        assert_eq!(wrapped_step(0, 5, false), 4);
+        assert_eq!(wrapped_step(2, 5, true), 3);
+        assert_eq!(wrapped_step(2, 5, false), 1);
+        assert_eq!(wrapped_step(0, 1, true), 0);
+    }
 
     #[test]
     fn strip_visible_range_matches_drawn_thumbnails() {

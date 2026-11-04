@@ -1,4 +1,6 @@
 pub mod autostart;
+mod hotkey_field;
+mod theme;
 pub mod window;
 
 use std::fs::{create_dir_all, File};
@@ -24,6 +26,9 @@ pub struct AppConfig {
     pub panel_mode: PanelMode,
     #[serde(default)]
     pub thumb_loading: ThumbLoading,
+    /// Cambiar el fondo con el fundido nativo de Windows.
+    #[serde(default = "default_wallpaper_fade")]
+    pub wallpaper_fade: bool,
     #[serde(default = "default_show_scrollbar")]
     pub show_scrollbar: bool,
     #[serde(default = "default_panel_margin")]
@@ -35,6 +40,7 @@ pub struct AppConfig {
 }
 
 fn default_show_scrollbar() -> bool { true }
+fn default_wallpaper_fade() -> bool { true }
 fn default_panel_margin() -> u32 { 16 }
 fn default_language() -> String { "auto".to_string() }
 
@@ -98,6 +104,126 @@ pub struct HotkeyBinding {
     pub key: String,
 }
 
+pub fn virtual_key_code(name: &str) -> Option<u32> {
+    let normalized = name.trim().to_ascii_uppercase();
+    if normalized.len() == 1 {
+        let byte = normalized.as_bytes()[0];
+        if byte.is_ascii_alphanumeric() {
+            return Some(byte as u32);
+        }
+    }
+    match normalized.as_str() {
+        "LEFT" => Some(0x25),
+        "UP" => Some(0x26),
+        "RIGHT" => Some(0x27),
+        "DOWN" => Some(0x28),
+        "SPACE" => Some(0x20),
+        "ENTER" => Some(0x0D),
+        "TAB" => Some(0x09),
+        "ESC" | "ESCAPE" => Some(0x1B),
+        "BACKSPACE" => Some(0x08),
+        "HOME" => Some(0x24),
+        "END" => Some(0x23),
+        "PAGEUP" => Some(0x21),
+        "PAGEDOWN" => Some(0x22),
+        "INSERT" => Some(0x2D),
+        "DELETE" => Some(0x2E),
+        value if value.starts_with('F') => value[1..].parse::<u32>().ok()
+            .filter(|number| (1..=24).contains(number))
+            .map(|number| 0x70 + number - 1),
+        value if value.starts_with("0X") => u32::from_str_radix(&value[2..], 16).ok().filter(|code| (1..=0xFE).contains(code)),
+        _ => None,
+    }
+}
+
+/// Nombre con el que se guarda una tecla virtual (inverso de `virtual_key_code`).
+fn virtual_key_name(code: u32) -> String {
+    match code {
+        0x30..=0x39 | 0x41..=0x5A => char::from(code as u8).to_string(),
+        0x25 => "LEFT".into(),
+        0x26 => "UP".into(),
+        0x27 => "RIGHT".into(),
+        0x28 => "DOWN".into(),
+        0x20 => "SPACE".into(),
+        0x0D => "ENTER".into(),
+        0x09 => "TAB".into(),
+        0x1B => "ESC".into(),
+        0x08 => "BACKSPACE".into(),
+        0x24 => "HOME".into(),
+        0x23 => "END".into(),
+        0x21 => "PAGEUP".into(),
+        0x22 => "PAGEDOWN".into(),
+        0x2D => "INSERT".into(),
+        0x2E => "DELETE".into(),
+        0x70..=0x87 => format!("F{}", code - 0x70 + 1),
+        other => format!("0x{other:02X}"),
+    }
+}
+
+// Formato del control de atajos de Windows (HKM_GETHOTKEY): tecla en el byte bajo y
+// modificadores en el alto.
+pub(crate) const HOTKEYF_SHIFT: u16 = 0x01;
+pub(crate) const HOTKEYF_CONTROL: u16 = 0x02;
+pub(crate) const HOTKEYF_ALT: u16 = 0x04;
+pub(crate) const HOTKEYF_EXT: u16 = 0x08;
+/// Propio de SWEPR (el control de Windows no admite la tecla Windows).
+pub(crate) const HOTKEYF_WIN: u16 = 0x10;
+
+impl HotkeyBinding {
+    /// Valor para el campo de atajos, o 0 si no hay tecla.
+    pub fn to_hotkey_value(&self) -> u16 {
+        let Some(code) = virtual_key_code(&self.key) else { return 0; };
+        let mut flags = 0;
+        for modifier in &self.modifiers {
+            flags |= match modifier.trim().to_ascii_uppercase().as_str() {
+                "CTRL" | "CONTROL" => HOTKEYF_CONTROL,
+                "ALT" => HOTKEYF_ALT,
+                "SHIFT" => HOTKEYF_SHIFT,
+                "WIN" | "WINDOWS" => HOTKEYF_WIN,
+                _ => 0,
+            };
+        }
+        // Flechas y bloque Inicio/Fin: sin la marca extendida el control las muestra como teclas del teclado numérico.
+        if matches!(code, 0x21..=0x28 | 0x2D | 0x2E) {
+            flags |= HOTKEYF_EXT;
+        }
+        (flags << 8) | code as u16
+    }
+
+    pub fn from_hotkey_value(value: u16) -> Self {
+        let code = (value & 0xFF) as u32;
+        if code == 0 {
+            return HotkeyBinding { modifiers: Vec::new(), key: String::new() };
+        }
+        let flags = value >> 8;
+        let mut modifiers = Vec::new();
+        if flags & HOTKEYF_CONTROL != 0 { modifiers.push("CTRL".to_string()); }
+        if flags & HOTKEYF_ALT != 0 { modifiers.push("ALT".to_string()); }
+        if flags & HOTKEYF_SHIFT != 0 { modifiers.push("SHIFT".to_string()); }
+        if flags & HOTKEYF_WIN != 0 { modifiers.push("WIN".to_string()); }
+        HotkeyBinding { modifiers, key: virtual_key_name(code) }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.key.trim().is_empty()
+    }
+
+    /// Mismo atajo aunque cambie el orden o las mayúsculas.
+    pub fn same_as(&self, other: &HotkeyBinding) -> bool {
+        let normalize = |binding: &HotkeyBinding| {
+            let mut modifiers: Vec<String> = binding.modifiers.iter().map(|m| match m.trim().to_ascii_uppercase().as_str() {
+                "CONTROL" => "CTRL".to_string(),
+                "WINDOWS" => "WIN".to_string(),
+                other => other.to_string(),
+            }).collect();
+            modifiers.sort();
+            (modifiers, virtual_key_code(&binding.key))
+        };
+        normalize(self) == normalize(other)
+    }
+}
+
+
 fn default_open_panel_hotkey() -> HotkeyBinding {
     HotkeyBinding { modifiers: vec!["CTRL".into(), "ALT".into()], key: "P".into() }
 }
@@ -139,6 +265,7 @@ impl Default for AppConfig {
             panel_side: PanelSide::Top,
             panel_mode: PanelMode::LowPower,
             thumb_loading: ThumbLoading::Preload,
+            wallpaper_fade: default_wallpaper_fade(),
             show_scrollbar: true,
             panel_margin: default_panel_margin(),
             language: default_language(),
@@ -190,6 +317,10 @@ impl AppConfig {
                         .ok()
                         .and_then(|value| value.get("thumb_loading").cloned())
                         .is_some();
+                    let has_wallpaper_fade = serde_json::from_str::<serde_json::Value>(&contents)
+                        .ok()
+                        .and_then(|value| value.get("wallpaper_fade").cloned())
+                        .is_some();
                     let has_show_scrollbar = serde_json::from_str::<serde_json::Value>(&contents)
                         .ok()
                         .and_then(|value| value.get("show_scrollbar").cloned())
@@ -206,7 +337,7 @@ impl AppConfig {
                         .ok()
                         .map(|value| value.get("acrylic_enabled").is_some() || value.get("acrylic_opacity").is_some())
                         .unwrap_or(false);
-                    if !has_all_hotkeys || !has_panel_side || !has_panel_mode || !has_thumb_loading || !has_show_scrollbar || !has_panel_margin || !has_language || has_legacy_acrylic || zones_changed {
+                    if !has_all_hotkeys || !has_panel_side || !has_panel_mode || !has_thumb_loading || !has_wallpaper_fade || !has_show_scrollbar || !has_panel_margin || !has_language || has_legacy_acrylic || zones_changed {
                         let _ = config.save();
                     }
                     log_info!("Configuración general cargada desde {:?}", path);
@@ -238,5 +369,31 @@ impl AppConfig {
 
         log_info!("Configuración persistida en {:?}", path);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod hotkey_tests {
+    use super::*;
+
+    fn binding(modifiers: &[&str], key: &str) -> HotkeyBinding {
+        HotkeyBinding { modifiers: modifiers.iter().map(|m| m.to_string()).collect(), key: key.into() }
+    }
+
+    #[test]
+    fn hotkey_value_roundtrips() {
+        for original in [binding(&["CTRL", "ALT"], "P"), binding(&["CTRL", "ALT"], "LEFT"), binding(&["SHIFT", "ALT"], "F5"), binding(&["CTRL"], "0x6B"), binding(&["WIN", "SHIFT"], "W")] {
+            let back = HotkeyBinding::from_hotkey_value(original.to_hotkey_value());
+            assert!(back.same_as(&original), "{original:?} -> {back:?}");
+        }
+        // Las flechas llevan la marca extendida para no mostrarse como teclado numérico.
+        assert_eq!(binding(&["CTRL", "ALT"], "RIGHT").to_hotkey_value(), ((0x02 | 0x04 | 0x08) << 8) | 0x27);
+        assert!(HotkeyBinding::from_hotkey_value(0).is_empty());
+    }
+
+    #[test]
+    fn same_as_ignores_order_and_case() {
+        assert!(binding(&["alt", "Control"], "p").same_as(&binding(&["CTRL", "ALT"], "P")));
+        assert!(!binding(&["CTRL", "ALT"], "P").same_as(&binding(&["CTRL", "WIN"], "P")));
     }
 }
