@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
-use crate::log_info;
+use crate::{log_debug, log_info};
 use crate::winutil::{get_window_class_name, get_window_process_info, get_window_text};
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
@@ -91,18 +91,21 @@ impl Drop for FocusDetector {
 /// Evalúa la ventana en primer plano dada, registra sus propiedades en el log y devuelve si es escritorio.
 pub fn evaluate_window_focus(hwnd: HWND) -> bool {
     let class_name = get_window_class_name(hwnd);
-    let title = get_window_text(hwnd);
-    let (pid, proc_name) = get_window_process_info(hwnd);
     let is_desktop = is_desktop_window(&class_name);
 
-    log_info!(
-        "Foco cambiado -> Clase: \"{}\" | Título: \"{}\" | Proceso: \"{}\" (PID: {}) | ¿Escritorio con foco?: {}",
-        class_name,
-        title,
-        proc_name,
-        pid,
-        if is_desktop { "SÍ" } else { "NO" }
-    );
+    // Título y proceso solo sirven para el log: en release no se consultan.
+    if cfg!(debug_assertions) {
+        let title = get_window_text(hwnd);
+        let (pid, proc_name) = get_window_process_info(hwnd);
+        log_debug!(
+            "Foco cambiado -> Clase: \"{}\" | Título: \"{}\" | Proceso: \"{}\" (PID: {}) | ¿Escritorio con foco?: {}",
+            class_name,
+            title,
+            proc_name,
+            pid,
+            if is_desktop { "SÍ" } else { "NO" }
+        );
+    }
 
     is_desktop
 }

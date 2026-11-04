@@ -1,4 +1,4 @@
-use crate::log_info;
+use crate::log_debug;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::Input::{
     RegisterRawInputDevices, RAWINPUTDEVICE, RIDEV_INPUTSINK, RIDEV_REMOVE,
@@ -38,7 +38,7 @@ impl MouseDetector {
         }
 
         self.is_registered = true;
-        log_info!("Raw Input registrado (escritorio con foco) | HWND: {:?}", self.hwnd);
+        log_debug!("Raw Input registrado (escritorio con foco) | HWND: {:?}", self.hwnd);
         Ok(())
     }
 
@@ -61,7 +61,7 @@ impl MouseDetector {
         }
 
         self.is_registered = false;
-        log_info!("Raw Input desregistrado (foco perdido en el escritorio)");
+        log_debug!("Raw Input desregistrado (foco perdido en el escritorio)");
         Ok(())
     }
 

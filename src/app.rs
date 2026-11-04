@@ -1,10 +1,9 @@
-use crate::config::AppConfig;
+use crate::config::{AppConfig, ThumbLoading};
 use crate::detector::focus::{evaluate_window_focus, FocusDetector, WM_APP_FOREGROUND_CHANGED};
 use crate::detector::mouse::MouseDetector;
 use crate::detector::zones::{ZoneDetector, ZONE_TIMER_ID};
 use crate::log_error;
 use crate::log_info;
-use crate::log_resource_usage;
 use crate::log_warn;
 use crate::panel;
 use crate::scanner::{Scanner, WM_APP_SCAN_COMPLETE};
@@ -24,8 +23,8 @@ pub const WM_APP_GEN_THUMBS: u32 = windows::Win32::UI::WindowsAndMessaging::WM_A
 // WM_APP para notificar cambio de configuración
 pub const WM_APP_CONFIG_CHANGED: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 42;
 
-// Timer periódico para medición de recursos
-pub const RESOURCE_TIMER_ID: usize = 9002;
+/// En carga bajo demanda, miniaturas que se precargan a cada lado del fondo actual.
+const ON_DEMAND_PREFETCH: usize = 30;
 
 // Función para solicitar aplicación de wallpaper desde el panel
 pub fn request_apply_wallpaper(path: &std::path::PathBuf) {
@@ -194,11 +193,12 @@ unsafe extern "system" fn wnd_proc(
                 match wparam.0 as i32 {
                     HOTKEY_PANEL_ID => panel::show_panel_from_hotkey(),
                     HOTKEY_PREVIOUS_ID | HOTKEY_NEXT_ID => {
-                        let images = state.scanned_images.lock().ok().map(|items| items.clone()).unwrap_or_default();
-                        if !images.is_empty() {
-                            let current = state.wallpaper_manager.get_current_wallpaper().ok();
+                        let current = state.wallpaper_manager.get_current_wallpaper().ok().map(|path| path.to_string_lossy().to_string());
+                        // Solo se copia la ruta elegida, no la lista completa.
+                        let target = state.scanned_images.lock().ok().and_then(|images| {
+                            if images.is_empty() { return None; }
                             let current_index = current.as_ref().and_then(|path| {
-                                images.iter().position(|image| image.path.to_string_lossy().eq_ignore_ascii_case(&path.to_string_lossy()))
+                                images.iter().position(|image| image.path.to_string_lossy().eq_ignore_ascii_case(path))
                             });
                             let index = match (wparam.0 as i32, current_index) {
                                 (HOTKEY_PREVIOUS_ID, Some(0)) => images.len() - 1,
@@ -208,7 +208,10 @@ unsafe extern "system" fn wnd_proc(
                                 (HOTKEY_NEXT_ID, None) => 0,
                                 _ => 0,
                             };
-                            request_apply_wallpaper(&images[index].path);
+                            Some(images[index].path.clone())
+                        });
+                        if let Some(path) = target {
+                            request_apply_wallpaper(&path);
                         }
                     }
                     _ => {}
@@ -313,6 +316,17 @@ unsafe extern "system" fn wnd_proc(
             WM_APP_SCAN_COMPLETE => {
                 state.last_scan_count = wparam.0 as usize;
                 log_info!("Escaneo completado - {} imágenes listas en memoria.", state.last_scan_count);
+                // Liberar las miniaturas de archivos que ya no están en la carpeta.
+                let removed = {
+                    let images = state.scanned_images.lock().ok();
+                    let present: std::collections::HashSet<String> = images.iter()
+                        .flat_map(|images| images.iter().map(|img| img.path.to_string_lossy().to_string()))
+                        .collect();
+                    state.thumb_cache.retain(|key| present.contains(key))
+                };
+                if removed > 0 {
+                    log_info!("Miniaturas de {} archivos que ya no existen liberadas.", removed);
+                }
                 panel::set_draw_context(state.thumb_cache.clone(), state.scanned_images.clone());
                 panel::request_repaint();
                 // Generar miniaturas en segundo plano
@@ -360,37 +374,39 @@ unsafe extern "system" fn wnd_proc(
                 return LRESULT(0);
             }
             WM_APP_GEN_THUMBS => {
-                // Generar miniaturas para todas las imágenes escaneadas en un solo hilo
-                let thumb_size = state.config.lock().unwrap().thumb_size_value() as i32;
+                let (thumb_size, loading) = {
+                    let config = state.config.lock().unwrap();
+                    (config.thumb_size_value() as i32, config.thumb_loading)
+                };
                 let images: Vec<std::path::PathBuf> = state.scanned_images.lock().ok()
                     .map(|g| g.iter().map(|img| img.path.clone()).collect())
                     .unwrap_or_default();
-                let hwnd_val = hwnd.0 as isize;
-                let cache = state.thumb_cache.clone();
-                std::thread::spawn(move || {
-                    // Inicializar COM una sola vez para todo el lote de miniaturas del hilo
-                    unsafe {
-                        use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
-                        let hr = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-                        for path in images {
-                            crate::thumbs::request_thumbnail(
-                                windows::Win32::Foundation::HWND(hwnd_val as *mut _),
-                                &path,
-                                thumb_size,
-                                cache.clone(),
-                            );
-                        }
-                        if hr.is_ok() {
-                            CoUninitialize();
-                        }
+                // Lo pendiente de un escaneo anterior ya no sirve: se vuelve a pedir lo que falte.
+                crate::thumbs::cancel_pending();
+                let wanted: &[std::path::PathBuf] = match loading {
+                    ThumbLoading::Preload => &images,
+                    ThumbLoading::OnDemand => {
+                        // Solo las cercanas al fondo actual, para que el panel abra sin huecos.
+                        let current = state.wallpaper_manager.get_current_wallpaper().ok();
+                        let center = current
+                            .and_then(|path| images.iter().position(|p| p.to_string_lossy().eq_ignore_ascii_case(&path.to_string_lossy())))
+                            .unwrap_or(0);
+                        let start = center.saturating_sub(ON_DEMAND_PREFETCH);
+                        &images[start..(center + ON_DEMAND_PREFETCH).min(images.len())]
                     }
-                });
+                };
+                crate::thumbs::request_thumbnails(wanted.iter().map(|p| p.as_path()), thumb_size, &state.thumb_cache, hwnd);
                 return LRESULT(0);
             }
             WM_APP_CONFIG_CHANGED => {
                 log_info!("Configuración cambiada, limpiando caché y reescaneando...");
-                // Limpiar caché de miniaturas
+                // Limpiar caché de miniaturas (y lo pendiente, que sería del tamaño anterior)
+                crate::thumbs::cancel_pending();
                 state.thumb_cache.clear();
+                {
+                    let config = state.config.lock().unwrap();
+                    panel::set_thumbnail_loading(config.thumb_loading == ThumbLoading::OnDemand, config.thumb_size_value() as i32);
+                }
                 panel::clear_carousel_tiles();
                 let (by_date, wallpaper_dir, scan_subfolders, detection_enabled, panel_side, panel_mode, show_scrollbar, panel_margin, language, mut zones) = {
                     let config = state.config.lock().unwrap();
@@ -451,10 +467,6 @@ unsafe extern "system" fn wnd_proc(
                         by_date,
                         state.scanned_images.clone(),
                     );
-                    return LRESULT(0);
-                }
-                if wparam.0 == RESOURCE_TIMER_ID {
-                    log_resource_usage();
                     return LRESULT(0);
                 }
             }
@@ -534,6 +546,7 @@ impl App {
         crate::i18n::set_language(config.language.clone());
         panel::set_panel_side(config.panel_side);
         panel::set_panel_mode(config.panel_mode);
+        panel::set_thumbnail_loading(config.thumb_loading == ThumbLoading::OnDemand, config.thumb_size_value() as i32);
         panel::set_scrollbar_visible(config.show_scrollbar);
         panel::set_panel_margin(config.panel_margin);
 

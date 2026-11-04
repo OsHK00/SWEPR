@@ -1,7 +1,7 @@
 
 
 use serde::{Deserialize, Serialize};
-use crate::log_info;
+use crate::{log_debug, log_info};
 use crate::winutil::{
     get_cursor_position, get_monitor_rect_from_point, is_any_mouse_button_down,
     is_notification_allowed,
@@ -108,6 +108,8 @@ pub struct ZoneDetector {
     pub is_triggered: bool,
     pub thumb_cache: Option<ThumbnailCache>,
     pub scanned_images: Option<Arc<Mutex<Vec<ScannedImage>>>>,
+    /// Último monitor consultado; se reutiliza mientras el cursor siga dentro de él.
+    last_monitor: Option<(HMONITOR, RECT)>,
 }
 
 impl ZoneDetector {
@@ -120,6 +122,7 @@ impl ZoneDetector {
             is_triggered: false,
             thumb_cache: None,
             scanned_images: None,
+            last_monitor: None,
         }
     }
 
@@ -138,7 +141,7 @@ impl ZoneDetector {
         // Descarta si hay botones del mouse presionados (arrastre de iconos o recuadro de seleccion)
         if is_any_mouse_button_down() {
             if self.is_timer_running {
-                log_info!("Timer cancelado: boton del mouse presionado durante movimiento.");
+                log_debug!("Timer cancelado: boton del mouse presionado durante movimiento.");
                 self.stop_timer();
             }
             self.current_zone = None;
@@ -146,13 +149,15 @@ impl ZoneDetector {
             return;
         }
 
-        let monitor_info = match get_monitor_rect_from_point(pt) {
+        let cached = self.last_monitor.filter(|(_, r)| pt.x >= r.left && pt.x < r.right && pt.y >= r.top && pt.y < r.bottom);
+        let monitor_info = match cached.or_else(|| get_monitor_rect_from_point(pt)) {
             Some(info) => info,
             None => {
                 self.reset();
                 return;
             }
         };
+        self.last_monitor = Some(monitor_info);
 
         let (hmon, rect) = monitor_info;
         let detected = hit_test(&self.config, &rect, &pt);
@@ -172,7 +177,7 @@ impl ZoneDetector {
                 self.current_zone = Some((zone, hmon));
                 self.is_triggered = false;
 
-                log_info!(
+                log_debug!(
                     "Cursor entro en zona {:?} (Monitor: {:?}). Demora configurada: {} ms. Timer temporal iniciado.",
                     zone,
                     hmon,
@@ -181,7 +186,7 @@ impl ZoneDetector {
             }
             None => {
                 if self.is_timer_running {
-                    log_info!("Cursor salio de la zona antes del timeout. Destruyendo timer.");
+                    log_debug!("Cursor salio de la zona antes del timeout. Destruyendo timer.");
                     self.stop_timer();
                 }
                 self.current_zone = None;
@@ -234,7 +239,7 @@ impl ZoneDetector {
             }
         }
 
-        log_info!("Activacion descartada: el cursor ya no se encontraba en la zona al cumplirse el plazo.");
+        log_debug!("Activacion descartada: el cursor ya no se encontraba en la zona al cumplirse el plazo.");
         self.current_zone = None;
         self.is_triggered = false;
     }
@@ -257,6 +262,7 @@ impl ZoneDetector {
 
     /// Cancela timers activos y reinicia el estado de deteccion (por ejemplo ante perdida de foco o suspension).
     pub fn reset(&mut self) {
+        self.last_monitor = None;
         self.stop_timer();
         self.current_zone = None;
         self.is_triggered = false;

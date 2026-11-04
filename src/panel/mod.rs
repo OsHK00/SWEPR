@@ -47,6 +47,12 @@ const COLOR_CURRENT: COLORREF = COLORREF(0x00FFC24C);
 const COLOR_NEW: COLORREF = COLORREF(0x005FCB6C);
 const BASE_NEW_BADGE: i32 = 10;
 
+/// Carga de miniaturas bajo demanda (si no, se generan todas al escanear).
+static PANEL_THUMBS_ON_DEMAND: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static PANEL_THUMB_SIZE_PX: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(128);
+/// Máximo de miniaturas pequeñas en memoria en modo bajo demanda.
+const ON_DEMAND_CAPACITY: usize = 200;
+
 static PANEL_DPI: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(96);
 
 fn px(value: i32) -> i32 {
@@ -286,6 +292,76 @@ fn set_hover_target(hwnd: HWND, new_hover: Option<usize>) {
 }
 
 /// Pinta el contenido del panel (fondo, miniaturas o carrusel, barra y avisos) en `dc`.
+/// Lienzo fuera de pantalla (DC, bitmap, bitmap original, ancho, alto). Se crea al pintar
+/// la primera vez y se reutiliza en cada fotograma hasta que el panel se oculta.
+static PANEL_BACKBUFFER: Mutex<Option<(isize, isize, isize, i32, i32)>> = Mutex::new(None);
+
+unsafe fn backbuffer_dc(hdc: windows::Win32::Graphics::Gdi::HDC, width: i32, height: i32) -> Option<windows::Win32::Graphics::Gdi::HDC> {
+    use windows::Win32::Graphics::Gdi::HDC;
+    let current = PANEL_BACKBUFFER.lock().ok().and_then(|g| *g);
+    if let Some((dc, _, _, w, h)) = current {
+        if w == width && h == height { return Some(HDC(dc as *mut _)); }
+        release_backbuffer();
+    }
+    let dc = CreateCompatibleDC(hdc);
+    let bmp = CreateCompatibleBitmap(hdc, width, height);
+    if dc.is_invalid() || bmp.is_invalid() {
+        let _ = DeleteObject(bmp);
+        let _ = DeleteDC(dc);
+        return None;
+    }
+    let old = SelectObject(dc, bmp);
+    if let Ok(mut g) = PANEL_BACKBUFFER.lock() { *g = Some((dc.0 as isize, bmp.0 as isize, old.0 as isize, width, height)); }
+    Some(dc)
+}
+
+fn release_backbuffer() {
+    use windows::Win32::Graphics::Gdi::{HDC, HGDIOBJ};
+    if let Some((dc, bmp, old, _, _)) = PANEL_BACKBUFFER.lock().ok().and_then(|mut g| g.take()) {
+        unsafe {
+            SelectObject(HDC(dc as *mut _), HGDIOBJ(old as *mut _));
+            let _ = DeleteObject(HGDIOBJ(bmp as *mut _));
+            let _ = DeleteDC(HDC(dc as *mut _));
+        }
+    }
+}
+
+/// Rango de índices de la tira que se ve en pantalla.
+fn strip_visible_range(count: usize, viewport: i32, scroll: i32, vertical: bool) -> std::ops::Range<usize> {
+    if count == 0 { return 0..0; }
+    let item = if vertical { thumb_h() } else { thumb_w() };
+    let extent = item + thumb_margin();
+    let (first_x, first_y) = thumbnail_origin(0, count, viewport, scroll, vertical);
+    let first = if vertical { first_y } else { first_x };
+    let start = ((-first - item).div_euclid(extent) + 1).max(0) as usize;
+    let end = (viewport - first + extent - 1).div_euclid(extent).max(0) as usize;
+    start.min(count)..end.min(count)
+}
+
+/// En modo bajo demanda: pide las miniaturas visibles y las de alrededor, y expulsa
+/// las usadas hace más tiempo cuando se supera la capacidad.
+fn load_thumbnails_on_demand(images: &[ScannedImage], cache: &ThumbnailCache, visible: std::ops::Range<usize>) {
+    use std::sync::atomic::Ordering;
+    if !PANEL_THUMBS_ON_DEMAND.load(Ordering::Relaxed) || visible.is_empty() { return; }
+    // Margen de dos "pantallas" a cada lado para que el desplazamiento normal no muestre huecos.
+    let margin = (visible.len() * 2).max(4);
+    let wanted = visible.start.saturating_sub(margin)..(visible.end + margin).min(images.len());
+    let keys: std::collections::HashSet<String> = images[wanted.clone()].iter().map(|img| img.path.to_string_lossy().to_string()).collect();
+    crate::thumbs::retain_pending(|key| keys.contains(key));
+    // Primero las visibles, luego las del margen.
+    let order = images[visible.clone()].iter().chain(images[wanted.start..visible.start].iter().rev()).chain(images[visible.end..wanted.end].iter());
+    let notify = crate::app::MAIN_HWND.lock().ok().and_then(|g| *g).map(|h| HWND(h as *mut _)).unwrap_or_default();
+    crate::thumbs::request_thumbnails(order.map(|img| img.path.as_path()), PANEL_THUMB_SIZE_PX.load(Ordering::Relaxed), cache, notify);
+    cache.touch(keys.iter().map(|key| key.as_str()));
+    cache.evict_to(ON_DEMAND_CAPACITY.max(keys.len()));
+}
+
+pub fn set_thumbnail_loading(on_demand: bool, size_px: i32) {
+    use std::sync::atomic::Ordering;
+    PANEL_THUMBS_ON_DEMAND.store(on_demand, Ordering::Relaxed);
+    PANEL_THUMB_SIZE_PX.store(size_px, Ordering::Relaxed);
+}
+
 unsafe fn paint_contents(dc: windows::Win32::Graphics::Gdi::HDC, hwnd: HWND, width: i32, height: i32) {
     let bg = CreateSolidBrush(COLOR_BACKGROUND);
     let _ = FillRect(dc, &RECT { left: 0, top: 0, right: width, bottom: height }, bg);
@@ -298,6 +374,14 @@ unsafe fn paint_contents(dc: windows::Win32::Graphics::Gdi::HDC, hwnd: HWND, wid
     let hover = if let Ok(g) = PANEL_HOVER_INDEX.lock() { *g } else { None };
     let current_wp = if let Ok(g) = PANEL_CURRENT_WALLPAPER.lock() { g.clone() } else { None };
     let selected = if let Ok(g) = PANEL_SELECTED_INDEX.lock() { *g } else { None };
+
+    if let (Some(cache), Some(images)) = (cache_opt.as_ref(), images_opt.as_ref().and_then(|arc| arc.lock().ok())) {
+        let visible = match carousel::layout().filter(|_| is_carousel()) {
+            Some(layout) => layout.visible_range(images.len(), width, scroll),
+            None => strip_visible_range(images.len(), if vertical { height } else { width }, scroll, vertical),
+        };
+        load_thumbnails_on_demand(&images, cache, visible);
+    }
 
     if is_carousel() {
         if let Some(images) = images_opt.as_ref().and_then(|arc| arc.lock().ok()) {
@@ -448,9 +532,11 @@ unsafe extern "system" fn panel_wnd_proc(
                     if let Ok(mut v) = PANEL_VISIBLE.lock() { *v = false; }
                     if let Ok(mut e) = PANEL_EXITING.lock() { *e = false; }
                     if let Ok(mut stg) = PANEL_STATE.lock() { *stg = None; }
+                    release_backbuffer();
                     if is_carousel() {
                         let _ = SetTimer(hwnd, TILE_RELEASE_TIMER_ID, TILE_RELEASE_DELAY_MS, None);
                     }
+                    crate::log::log_resource_usage();
                 }
                 return LRESULT(0);
             }
@@ -554,15 +640,10 @@ unsafe extern "system" fn panel_wnd_proc(
                 let width = rect.right - rect.left;
                 let height = rect.bottom - rect.top;
 
-                let mem_dc = CreateCompatibleDC(hdc);
-                let mem_bmp = CreateCompatibleBitmap(hdc, width, height);
-                let old_bmp = SelectObject(mem_dc, mem_bmp);
-                paint_contents(mem_dc, hwnd, width, height);
-
-                let _ = BitBlt(hdc, 0, 0, width, height, mem_dc, 0, 0, SRCCOPY);
-                SelectObject(mem_dc, old_bmp);
-                let _ = DeleteObject(mem_bmp);
-                let _ = DeleteDC(mem_dc);
+                if let Some(mem_dc) = backbuffer_dc(hdc, width, height) {
+                    paint_contents(mem_dc, hwnd, width, height);
+                    let _ = BitBlt(hdc, 0, 0, width, height, mem_dc, 0, 0, SRCCOPY);
+                }
                 let _ = EndPaint(hwnd, &ps);
             }
             LRESULT(0)
@@ -976,7 +1057,7 @@ fn show_panel_with_close_on_mouse_leave(close_on_mouse_leave: bool) {
         };
         let _ = SetTimer(hwnd, AUTO_CLOSE_TIMER_ID, close_check_ms, None);
         if let Ok(mut v) = PANEL_VISIBLE.lock() { *v = true; }
-        log_info!("Panel: mostrado en monitor con animacion desde arriba");
+        crate::log_debug!("Panel: mostrado");
     }
 }
 pub fn hide_panel() {
@@ -1020,7 +1101,7 @@ pub fn hide_panel() {
             }
             if let Ok(mut e) = PANEL_EXITING.lock() { *e = true; }
             let _ = SetTimer(hwnd, ANIM_TIMER_ID, ANIM_STEP_MS, None);
-            log_info!("Panel: animando salida");
+            crate::log_debug!("Panel: animando salida");
         }
     }
 }
@@ -1093,6 +1174,24 @@ pub(crate) unsafe fn save_bmp(dc: windows::Win32::Graphics::Gdi::HDC, bmp: windo
 mod tests {
     use super::*;
 
+    #[test]
+    fn strip_visible_range_matches_drawn_thumbnails() {
+        for vertical in [false, true] {
+            let (count, viewport) = (40, 1000);
+            for scroll in [0, 7, 333, 1500] {
+                let range = strip_visible_range(count, viewport, scroll, vertical);
+                for index in 0..count {
+                    let (x, y) = thumbnail_origin(index, count, viewport, scroll, vertical);
+                    let (start, size) = if vertical { (y, thumb_h()) } else { (x, thumb_w()) };
+                    let on_screen = start + size > 0 && start < viewport;
+                    assert_eq!(range.contains(&index), on_screen, "vertical={vertical} scroll={scroll} index={index}");
+                }
+            }
+        }
+        // Pocas miniaturas: se centran y todas se ven.
+        assert_eq!(strip_visible_range(3, 1000, 0, false), 0..3);
+    }
+
     unsafe fn render(width: i32, height: i32, path: &str) {
         let screen = windows::Win32::Graphics::Gdi::GetDC(None);
         let dc = CreateCompatibleDC(screen);
@@ -1123,8 +1222,15 @@ mod tests {
             is_new: i == 4 || i == 6,
         }).collect();
         let cache = ThumbnailCache::new();
-        for img in &images {
-            crate::thumbs::request_thumbnail(HWND::default(), &img.path, 128, cache.clone());
+        unsafe {
+            use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
+            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        }
+        crate::thumbs::request_thumbnails(images.iter().map(|img| img.path.as_path()), 128, &cache, HWND::default());
+        // El hilo de carga trabaja aparte: esperar a que estén todas.
+        let started = std::time::Instant::now();
+        while cache.len() < images.len() && started.elapsed().as_secs() < 10 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
         }
         PANEL_DPI.store(144, std::sync::atomic::Ordering::Relaxed);
         *PANEL_SIDE.lock().unwrap() = PanelSide::Top;

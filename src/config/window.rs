@@ -1,4 +1,4 @@
-use crate::config::{AppConfig, PanelMode, PanelSide};
+use crate::config::{AppConfig, PanelMode, PanelSide, ThumbLoading};
 use crate::log_info;
 use crate::winutil::{as_pcwstr, to_wide_chars};
 use std::sync::{Arc, Mutex};
@@ -39,6 +39,7 @@ const IDC_SECTION_PANEL: i32 = 1018;
 const IDC_SECTION_THUMBNAILS: i32 = 1019;
 const IDC_SECTION_FOLDER: i32 = 1020;
 const IDC_PANEL_MODE_COMBO: i32 = 1021;
+const IDC_THUMB_LOADING_COMBO: i32 = 1022;
 
 static CONFIG_HWND: Mutex<Option<isize>> = Mutex::new(None);
 static CONFIG_STATE: Mutex<Option<Arc<Mutex<AppConfig>>>> = Mutex::new(None);
@@ -150,24 +151,32 @@ unsafe fn create_config_controls(hwnd: HWND) {
     }
     add_control(hwnd, "BUTTON", &tr("Show scrollbar"), IDC_SCROLLBAR_CHK, 24, 320, 286, 28, CHECKBOX | TAB_STOP);
 
-    add_control(hwnd, "BUTTON", &tr("Thumbnail size"), IDC_SECTION_THUMBNAILS, 12, 378, 620, 142, GROUP_BOX);
+    add_control(hwnd, "BUTTON", &tr("Thumbnail size"), IDC_SECTION_THUMBNAILS, 12, 378, 620, 150, GROUP_BOX);
     add_control(hwnd, "BUTTON", &tr("Small (64 px)"), IDC_THUMB_CHK_64, 24, 408, 280, 30, RADIO_BUTTON | TAB_STOP);
     add_control(hwnd, "BUTTON", &tr("Standard (128 px)"), IDC_THUMB_CHK_128, 318, 408, 290, 30, RADIO_BUTTON | TAB_STOP);
     add_control(hwnd, "BUTTON", &tr("Large (256 px)"), IDC_THUMB_CHK_256, 24, 446, 280, 30, RADIO_BUTTON | TAB_STOP);
     add_control(hwnd, "BUTTON", &tr("Maximum (512 px)"), IDC_THUMB_CHK_512, 318, 446, 290, 30, RADIO_BUTTON | TAB_STOP);
 
-    add_control(hwnd, "STATIC", &tr("Smaller thumbnails use less memory. Changes apply after saving."), 0, 24, 526, 580, 20, 0);
-    add_control(hwnd, "BUTTON", &tr("Cancel"), IDC_CANCEL_BTN, 410, 560, 96, 32, TAB_STOP);
-    add_control(hwnd, "BUTTON", &tr("Save"), IDC_APPLY_BTN, 518, 560, 96, 32, TAB_STOP | 1);
+    add_control(hwnd, "STATIC", &tr("Thumbnail loading:"), 0, 24, 490, 286, 18, 0);
+    let loading_combo = add_control(hwnd, "COMBOBOX", &to_wide_chars(""), IDC_THUMB_LOADING_COMBO, 318, 486, 290, 100, COMBO_STYLE | TAB_STOP);
+    for item in ["All in advance", "On demand (less memory)"] {
+        let item = tr(item);
+        let _ = SendMessageW(loading_combo, windows::Win32::UI::WindowsAndMessaging::CB_ADDSTRING, WPARAM(0), LPARAM(item.as_ptr() as isize));
+    }
+
+    add_control(hwnd, "STATIC", &tr("Smaller thumbnails use less memory. Changes apply after saving."), 0, 24, 538, 580, 20, 0);
+    add_control(hwnd, "BUTTON", &tr("Cancel"), IDC_CANCEL_BTN, 410, 572, 96, 32, TAB_STOP);
+    add_control(hwnd, "BUTTON", &tr("Save"), IDC_APPLY_BTN, 518, 572, 96, 32, TAB_STOP | 1);
 }
 
-fn selected_panel_mode(combo: HWND) -> usize {
+/// Índice seleccionado de un combo.
+fn combo_selection(combo: HWND) -> usize {
     unsafe { SendMessageW(combo, windows::Win32::UI::WindowsAndMessaging::CB_GETCURSEL, WPARAM(0), LPARAM(0)).0 as usize }
 }
 
 /// La barra de desplazamiento solo existe en el modo de bajo consumo.
 unsafe fn update_mode_dependent_controls(hwnd: HWND) {
-    let pro = GetDlgItem(hwnd, IDC_PANEL_MODE_COMBO).map(|combo| selected_panel_mode(combo) == 1).unwrap_or(false);
+    let pro = GetDlgItem(hwnd, IDC_PANEL_MODE_COMBO).map(|combo| combo_selection(combo) == 1).unwrap_or(false);
     if let Ok(chk) = GetDlgItem(hwnd, IDC_SCROLLBAR_CHK) {
         let _ = windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow(chk, !pro);
     }
@@ -296,6 +305,10 @@ unsafe extern "system" fn config_wnd_proc(
                         let _ = SendMessageW(combo, windows::Win32::UI::WindowsAndMessaging::CB_SETCURSEL, WPARAM(selection), LPARAM(0));
                     }
                     update_mode_dependent_controls(hwnd);
+                    if let Ok(combo) = GetDlgItem(hwnd, IDC_THUMB_LOADING_COMBO) {
+                        let selection = if config.thumb_loading == ThumbLoading::OnDemand { 1 } else { 0 };
+                        let _ = SendMessageW(combo, windows::Win32::UI::WindowsAndMessaging::CB_SETCURSEL, WPARAM(selection), LPARAM(0));
+                    }
                     if let Ok(chk) = GetDlgItem(hwnd, IDC_SCROLLBAR_CHK) {
                         if !chk.is_invalid() {
                             use windows::Win32::UI::WindowsAndMessaging::BM_SETCHECK;
@@ -445,6 +458,9 @@ unsafe extern "system" fn config_wnd_proc(
                             if let Some(size) = thumb_size {
                                 config.thumb_size = size;
                             }
+                            if let Ok(combo) = GetDlgItem(hwnd, IDC_THUMB_LOADING_COMBO) {
+                                config.thumb_loading = if combo_selection(combo) == 1 { ThumbLoading::OnDemand } else { ThumbLoading::Preload };
+                            }
                             if let Ok(combo) = GetDlgItem(hwnd, IDC_PANEL_SIDE_COMBO) {
                                 let selected = SendMessageW(
                                     combo,
@@ -460,7 +476,7 @@ unsafe extern "system" fn config_wnd_proc(
                                 config.zones.active_zones = config.panel_side.active_zones();
                             }
                             if let Ok(combo) = GetDlgItem(hwnd, IDC_PANEL_MODE_COMBO) {
-                                config.panel_mode = if selected_panel_mode(combo) == 1 { PanelMode::Pro } else { PanelMode::LowPower };
+                                config.panel_mode = if combo_selection(combo) == 1 { PanelMode::Pro } else { PanelMode::LowPower };
                             }
                             if let Ok(chk) = GetDlgItem(hwnd, IDC_SCROLLBAR_CHK) {
                                 use windows::Win32::UI::WindowsAndMessaging::BM_GETCHECK;
@@ -576,7 +592,7 @@ pub fn show_config_window(config: Arc<Mutex<AppConfig>>) {
             as_pcwstr(&class_name_wide),
             as_pcwstr(&tr("SWEPR - Settings")),
             WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-            px(100), px(100), px(660), px(640),
+            px(100), px(100), px(660), px(652),
             None, None, hinstance, None,
         ) {
             Ok(h) => h,

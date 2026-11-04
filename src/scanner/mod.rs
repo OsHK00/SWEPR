@@ -44,41 +44,47 @@ impl Scanner {
 
         thread::spawn(move || {
             let start = std::time::Instant::now();
-            let mut images: Vec<ScannedImage> = Vec::new();
+            // La fecha solo se lee si se ordena por fecha; `DirEntry` ya trae tipo y fecha
+            // del listado del directorio, sin consultas extra al disco por archivo.
+            let mut found: Vec<(ScannedImage, Option<std::time::SystemTime>)> = Vec::new();
 
             let mut stack: Vec<PathBuf> = vec![folder.clone()];
             while let Some(dir) = stack.pop() {
-                if !include_subdirs && dir != folder {
-                    continue;
-                }
                 match std::fs::read_dir(&dir) {
                     Ok(entries) => {
                         for entry in entries.flatten() {
-                            let path = entry.path();
-                            if path.is_dir() {
+                            // Los enlaces se resuelven como antes; el resto sale gratis del listado.
+                            let file_type = match entry.file_type() {
+                                Ok(t) if t.is_symlink() => match std::fs::metadata(entry.path()) {
+                                    Ok(meta) => meta.file_type(),
+                                    Err(_) => continue,
+                                },
+                                Ok(t) => t,
+                                Err(_) => continue,
+                            };
+                            if file_type.is_dir() {
                                 if include_subdirs {
-                                    stack.push(path);
+                                    stack.push(entry.path());
                                 }
                                 continue;
                             }
-                            if !path.is_file() {
+                            if !file_type.is_file() {
                                 continue;
                             }
-                            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                                let ext_lower = ext.to_ascii_lowercase();
-                                if matches!(ext_lower.as_str(), "jpg" | "jpeg" | "png" | "bmp") {
-                                    let file_name = path
-                                        .file_name()
-                                        .and_then(|n| n.to_str())
-                                        .unwrap_or("")
-                                        .to_string();
-                                    images.push(ScannedImage {
-                                        path: path.clone(),
-                                        file_name,
-                                        is_new: false,
-                                    });
-                                }
+                            let path = entry.path();
+                            let is_image = path.extension().and_then(|e| e.to_str()).is_some_and(|ext| {
+                                matches!(ext.to_ascii_lowercase().as_str(), "jpg" | "jpeg" | "png" | "bmp")
+                            });
+                            if !is_image {
+                                continue;
                             }
+                            let modified = if order_by_date {
+                                entry.metadata().ok().and_then(|m| m.modified().ok())
+                            } else {
+                                None
+                            };
+                            let file_name = entry.file_name().to_string_lossy().to_string();
+                            found.push((ScannedImage { path, file_name, is_new: false }, modified));
                         }
                     }
                     Err(e) => {
@@ -88,19 +94,16 @@ impl Scanner {
             }
 
             if order_by_date {
-                images.sort_by(|a, b| {
-                    let ma = std::fs::metadata(&a.path).ok().and_then(|m| m.modified().ok());
-                    let mb = std::fs::metadata(&b.path).ok().and_then(|m| m.modified().ok());
-                    match (mb, ma) {
-                        (Some(bd), Some(ad)) => bd.cmp(&ad),
-                        (Some(_), None) => std::cmp::Ordering::Less,
-                        (None, Some(_)) => std::cmp::Ordering::Greater,
-                        (None, None) => a.file_name.to_lowercase().cmp(&b.file_name.to_lowercase()),
-                    }
+                found.sort_by(|(a, ma), (b, mb)| match (mb, ma) {
+                    (Some(bd), Some(ad)) => bd.cmp(ad),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => a.file_name.to_lowercase().cmp(&b.file_name.to_lowercase()),
                 });
             } else {
-                images.sort_by(|a, b| a.file_name.to_lowercase().cmp(&b.file_name.to_lowercase()));
+                found.sort_by_cached_key(|(image, _)| image.file_name.to_lowercase());
             }
+            let mut images: Vec<ScannedImage> = found.into_iter().map(|(image, _)| image).collect();
 
             for image in &mut images {
                 image.is_new = if is_initial_scan {

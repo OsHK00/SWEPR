@@ -4,8 +4,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
-use windows::Win32::Foundation::CloseHandle;
-use windows::Win32::System::Threading::{GetGuiResources, GetCurrentProcessId, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, GET_GUI_RESOURCES_FLAGS};
+use windows::Win32::System::Threading::{GetCurrentProcess, GetGuiResources, GR_GDIOBJECTS, GR_USEROBJECTS};
 use crate::{log_error, log_info};
 
 static LOG_FILE: Mutex<Option<File>> = Mutex::new(None);
@@ -63,29 +62,21 @@ pub fn write_log(level: &str, message: &str) {
     }
 }
 
-/// Registra el uso de recursos del proceso: memoria GDI/USER en uso, working set y handles.
+/// Registra el uso de recursos del proceso: objetos GDI/USER, working set y memoria privada.
 pub fn log_resource_usage() {
     unsafe {
-        let pid = GetCurrentProcessId();
-        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
-
-        if let Ok(handle) = process {
-            let gui_handles = GetGuiResources(handle, GET_GUI_RESOURCES_FLAGS(0));
-
-            let mut counters: PROCESS_MEMORY_COUNTERS = Default::default();
-            let ok = GetProcessMemoryInfo(handle, &mut counters, std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32);
-
-            if ok.is_ok() {
-                let working_set_mb = counters.WorkingSetSize / (1024 * 1024);
-                log_info!(
-                    "Recursos: PID {pid} | Handles GDI/USER: {gui_handles} | WorkingSet: {working_set_mb} MB"
-                );
-            } else {
-                log_error!("GetProcessMemoryInfo falló para PID {pid}");
-            }
-            let _ = CloseHandle(handle);
+        let process = GetCurrentProcess();
+        let gdi = GetGuiResources(process, GR_GDIOBJECTS);
+        let user = GetGuiResources(process, GR_USEROBJECTS);
+        let mut counters: PROCESS_MEMORY_COUNTERS = Default::default();
+        if GetProcessMemoryInfo(process, &mut counters, std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32).is_ok() {
+            log_info!(
+                "Recursos: objetos GDI {gdi} | USER {user} | WorkingSet: {} MB | Privada: {} MB",
+                counters.WorkingSetSize / (1024 * 1024),
+                counters.PagefileUsage / (1024 * 1024)
+            );
         } else {
-            log_error!("No se pudo abrir proceso para medir recursos (PID: {pid})");
+            log_error!("GetProcessMemoryInfo falló");
         }
     }
 }
@@ -94,6 +85,17 @@ pub fn log_resource_usage() {
 macro_rules! log_info {
     ($($arg:tt)*) => {
         $crate::log::write_log("INFO", &format!($($arg)*))
+    };
+}
+
+/// Detalle para depurar (cada miniatura, cada cambio de foco...). Solo existe en builds de
+/// desarrollo: en release no formatea ni escribe nada.
+#[macro_export]
+macro_rules! log_debug {
+    ($($arg:tt)*) => {
+        if cfg!(debug_assertions) {
+            $crate::log::write_log("DEBUG", &format!($($arg)*))
+        }
     };
 }
 
