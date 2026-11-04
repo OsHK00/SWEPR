@@ -1,7 +1,7 @@
 mod carousel;
 
 use crate::app;
-use crate::config::{PanelMode, PanelSide};
+use crate::config::{PanelMode, PanelSide, ProPriority};
 use crate::log_info;
 use crate::scanner::ScannedImage;
 use crate::thumbs::ThumbnailCache;
@@ -113,6 +113,8 @@ static PANEL_THUMB_ANIM: Mutex<bool> = Mutex::new(false);
 static PANEL_CURRENT_WALLPAPER: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
 /// Scroll hacia el que se anima el carrusel al cambiar la selección.
 static PANEL_SCROLL_TARGET: Mutex<Option<i32>> = Mutex::new(None);
+/// Posición virtual sin límite; el índice visible sigue siendo este valor módulo la cantidad.
+static PANEL_CAROUSEL_INDEX: Mutex<i64> = Mutex::new(0);
 
 fn is_carousel() -> bool {
     PANEL_MODE.lock().map(|mode| *mode == PanelMode::Pro).unwrap_or(false)
@@ -151,7 +153,8 @@ fn thumbnail_at(x: i32, y: i32) -> Option<usize> {
     let count = image_count();
     let scroll = PANEL_SCROLL_OFFSET.lock().map(|g| *g).unwrap_or(0);
     if let Some(layout) = carousel::layout().filter(|_| is_carousel()) {
-        return layout.hit_test(x, y, count, viewport(), scroll);
+        return layout.loop_hit_test(x, y, count, scroll)
+            .map(|virtual_index| virtual_index.rem_euclid(count.max(1) as i64) as usize);
     }
     let vertical = is_vertical();
     (0..count).find(|&idx| {
@@ -170,18 +173,21 @@ fn step_selection(hwnd: HWND, forward: bool) {
     let count = image_count();
     if count == 0 { return; }
     let sel = PANEL_SELECTED_INDEX.lock().ok().and_then(|g| *g).unwrap_or(0).min(count - 1);
-    let next = wrapped_step(sel, count, forward);
-    let wrapped = if forward { next < sel } else { next > sel };
-    if wrapped {
-        if let Some(layout) = carousel::layout().filter(|_| is_carousel()) {
-            // Al dar la vuelta, la animación empieza a una tarjeta del destino en vez de recorrer
-            // todo el carrusel (lo que además pediría las tarjetas de todo el recorrido).
-            let target = layout.center_scroll(next, count, viewport());
-            let start = if forward { target - layout.pitch() } else { target + layout.pitch() };
-            if let Ok(mut g) = PANEL_SCROLL_OFFSET.lock() { *g = start; }
+    if let Some(layout) = carousel::layout().filter(|_| is_carousel()) {
+        let virtual_index = if let Ok(mut index) = PANEL_CAROUSEL_INDEX.lock() {
+            *index += if forward { 1 } else { -1 };
+            *index
+        } else { sel as i64 + if forward { 1 } else { -1 } };
+        let next = virtual_index.rem_euclid(count as i64) as usize;
+        if let Ok(mut selected) = PANEL_SELECTED_INDEX.lock() { *selected = Some(next); }
+        set_hover_target(hwnd, Some(next));
+        if let Ok(mut target) = PANEL_SCROLL_TARGET.lock() {
+            *target = Some(layout.loop_center_scroll(virtual_index, viewport()));
         }
+        unsafe { let _ = SetTimer(hwnd, HOVER_ANIM_TIMER_ID, HOVER_ANIM_STEP_MS, None); }
+        return;
     }
-    select_index(hwnd, next);
+    select_index(hwnd, wrapped_step(sel, count, forward));
 }
 
 /// Selecciona una miniatura y desplaza la vista para que se vea (centrada en el carrusel).
@@ -190,7 +196,13 @@ fn select_index(hwnd: HWND, sel: usize) {
     set_hover_target(hwnd, Some(sel));
     let count = image_count();
     if let Some(layout) = carousel::layout().filter(|_| is_carousel()) {
-        if let Ok(mut target) = PANEL_SCROLL_TARGET.lock() { *target = Some(layout.center_scroll(sel, count, viewport())); }
+        let current = PANEL_CAROUSEL_INDEX.lock().map(|g| *g).unwrap_or(sel as i64);
+        let base = current.div_euclid(count.max(1) as i64) * count as i64 + sel as i64;
+        let virtual_index = [base - count as i64, base, base + count as i64]
+            .into_iter().min_by_key(|i| (layout.loop_center_scroll(*i, viewport()) - PANEL_SCROLL_OFFSET.lock().map(|g| *g).unwrap_or(0)).abs())
+            .unwrap_or(base);
+        if let Ok(mut index) = PANEL_CAROUSEL_INDEX.lock() { *index = virtual_index; }
+        if let Ok(mut target) = PANEL_SCROLL_TARGET.lock() { *target = Some(layout.loop_center_scroll(virtual_index, viewport())); }
         unsafe { let _ = SetTimer(hwnd, HOVER_ANIM_TIMER_ID, HOVER_ANIM_STEP_MS, None); }
         return;
     }
@@ -860,6 +872,10 @@ pub fn set_panel_mode(mode: PanelMode) {
     reopen_if_visible();
 }
 
+pub fn set_pro_priority(priority: ProPriority) {
+    carousel::set_smooth_priority(priority == ProPriority::Smooth);
+}
+
 /// Vuelve a mostrar el panel con la nueva disposición si estaba abierto.
 fn reopen_if_visible() {
     if is_panel_visible() {
@@ -972,7 +988,7 @@ fn show_panel_with_close_on_mouse_leave(close_on_mouse_leave: bool) {
                         0
                     };
                     let scroll = if let Some(layout) = layout {
-                        layout.center_scroll(idx, count, viewport)
+                        layout.loop_center_scroll(idx as i64, viewport)
                     } else {
                         let item_x = idx as i32 * item_extent + thumb_margin();
                         let center_scroll = (item_x + item_size / 2) - (viewport / 2);
@@ -1033,6 +1049,7 @@ fn show_panel_with_close_on_mouse_leave(close_on_mouse_leave: bool) {
         if let Ok(mut g) = PANEL_WIDTH.lock() { *g = width; }
         if let Ok(mut g) = PANEL_HEIGHT.lock() { *g = height; }
         if let Ok(mut g) = PANEL_SCROLL_OFFSET.lock() { *g = initial_scroll; }
+        if let Ok(mut g) = PANEL_CAROUSEL_INDEX.lock() { *g = selected_idx as i64; }
         if let Ok(mut g) = PANEL_SELECTED_INDEX.lock() { *g = Some(selected_idx); }
         if let Ok(mut g) = PANEL_HOVER_INDEX.lock() { *g = Some(selected_idx); }
         if let Ok(mut g) = PANEL_DRAGGING.lock() { *g = false; }

@@ -10,7 +10,7 @@ use crate::scanner::ScannedImage;
 use crate::thumbs::{Thumb, ThumbnailCache};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::Mutex;
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, POINT, RECT, WPARAM};
@@ -29,6 +29,15 @@ pub const FOCUS_SCALE: f32 = 1.12;
 
 const PREFETCH: usize = 2;
 const DIM_ALPHA: f32 = 110.0;
+static SMOOTH_PRIORITY: AtomicBool = AtomicBool::new(false);
+static PRELOAD_REQUESTED_GENERATION: AtomicU64 = AtomicU64::new(u64::MAX);
+
+pub fn set_smooth_priority(smooth: bool) {
+    if SMOOTH_PRIORITY.swap(smooth, Ordering::AcqRel) != smooth {
+        PRELOAD_REQUESTED_GENERATION.store(u64::MAX, Ordering::Release);
+        clear_tiles();
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Layout {
@@ -76,6 +85,7 @@ impl Layout {
     }
 
     /// Índice de la tarjeta bajo el punto, respetando los bordes inclinados.
+    #[cfg(test)]
     pub fn hit_test(&self, x: i32, y: i32, count: usize, viewport: i32, scroll: i32) -> Option<usize> {
         if count == 0 || y < self.pad_y || y >= self.pad_y + self.tile_h { return None; }
         let from_top = (y - self.pad_y) as f32 / self.tile_h as f32;
@@ -87,6 +97,7 @@ impl Layout {
     }
 
     /// Scroll que deja la tarjeta indicada en el centro de la franja.
+    #[cfg(test)]
     pub fn center_scroll(&self, index: usize, count: usize, viewport: i32) -> i32 {
         let center = self.margin_x + index as i32 * self.pitch() + self.bounds_w() / 2;
         (center - viewport / 2).clamp(0, self.max_scroll(count, viewport))
@@ -98,6 +109,34 @@ impl Layout {
         let first = ((-first_x - self.bounds_w()).div_euclid(self.pitch()) + 1).max(0) as usize;
         let last = (viewport - first_x + self.pitch() - 1).div_euclid(self.pitch()).max(0) as usize;
         first.min(count)..last.min(count)
+    }
+
+    /// Desplazamiento que centra una posición virtual del carrusel circular.
+    pub fn loop_center_scroll(&self, index: i64, viewport: i32) -> i32 {
+        (self.margin_x as i64 + index * self.pitch() as i64 + self.bounds_w() as i64 / 2
+            - viewport as i64 / 2).clamp(i32::MIN as i64, i32::MAX as i64) as i32
+    }
+
+    pub fn loop_visible_range(&self, viewport: i32, scroll: i32) -> std::ops::Range<i64> {
+        let first_x = self.margin_x - scroll;
+        let first = ((-first_x - self.bounds_w()).div_euclid(self.pitch()) + 1) as i64;
+        let last = (viewport - first_x + self.pitch() - 1).div_euclid(self.pitch()) as i64;
+        first..last.max(first)
+    }
+
+    pub fn loop_tile_x(&self, index: i64, scroll: i32) -> i32 {
+        (self.margin_x as i64 + index * self.pitch() as i64 - scroll as i64)
+            .clamp(i32::MIN as i64, i32::MAX as i64) as i32
+    }
+
+    pub fn loop_hit_test(&self, x: i32, y: i32, count: usize, scroll: i32) -> Option<i64> {
+        if count == 0 || y < self.pad_y || y >= self.pad_y + self.tile_h { return None; }
+        let from_top = (y - self.pad_y) as f32 / self.tile_h as f32;
+        let shift = (self.slant as f32 * (1.0 - from_top)) as i32;
+        let offset = x - (self.margin_x - scroll + shift);
+        if offset < 0 { return None; }
+        let index = offset.div_euclid(self.pitch());
+        (offset.rem_euclid(self.pitch()) < self.tile_w).then_some(index as i64)
     }
 
     /// Vértices de la tarjeta escalada alrededor de su centro.
@@ -228,16 +267,16 @@ pub fn clear_tiles() {
 }
 
 /// Pide las tarjetas que faltan y olvida las peticiones que ya no hacen falta.
-fn request_missing(images: &[ScannedImage], wanted: std::ops::Range<usize>, layout: &Layout, notify: HWND) {
-    let wanted_keys: Vec<(String, &Path)> = images[wanted]
-        .iter()
-        .map(|img| (img.path.to_string_lossy().to_string(), img.path.as_path()))
-        .collect();
+fn request_missing(images: &[ScannedImage], wanted: Vec<usize>, layout: &Layout, notify: HWND) {
+    let wanted_keys: Vec<(String, &Path)> = wanted.into_iter().filter_map(|index| images.get(index))
+        .map(|img| (img.path.to_string_lossy().to_string(), img.path.as_path())).collect();
     let missing: Vec<(String, &Path)> = {
         let Ok(cache) = TILES.lock() else { return; };
         let Ok(mut pending) = PENDING.lock() else { return; };
         let set = pending.get_or_insert_with(HashSet::new);
-        set.retain(|key| wanted_keys.iter().any(|(k, _)| k == key));
+        if !SMOOTH_PRIORITY.load(Ordering::Acquire) {
+            set.retain(|key| wanted_keys.iter().any(|(k, _)| k == key));
+        }
         wanted_keys
             .into_iter()
             .filter(|(key, _)| !cache.as_ref().is_some_and(|c| c.tiles.contains_key(key)) && set.insert(key.clone()))
@@ -289,26 +328,35 @@ pub unsafe fn paint(dc: HDC, width: i32, height: i32, input: &PaintInput) {
 
     let Some(layout) = layout() else { return; };
     let count = input.images.len();
-    let visible = layout.visible_range(count, width, input.scroll);
-    if visible.is_empty() { return; }
-
-    let wanted = visible.start.saturating_sub(PREFETCH)..(visible.end + PREFETCH).min(count);
-    request_missing(input.images, wanted.clone(), &layout, input.notify);
-    evict(wanted.len() + 4);
+    if count == 0 { return; }
+    let visible = layout.loop_visible_range(width, input.scroll);
+    let virtuals: Vec<i64> = visible.clone().collect();
+    let real_indices: HashSet<usize> = virtuals.iter().map(|i| i.rem_euclid(count as i64) as usize).collect();
+    let smooth = SMOOTH_PRIORITY.load(Ordering::Acquire);
+    let generation = GENERATION.load(Ordering::Acquire);
+    if smooth && PRELOAD_REQUESTED_GENERATION.swap(generation, Ordering::AcqRel) != generation {
+        request_missing(input.images, (0..count).collect(), &layout, input.notify);
+    } else if !smooth {
+        let prefetched = (visible.start - PREFETCH as i64..visible.end + PREFETCH as i64)
+            .map(|i| i.rem_euclid(count as i64) as usize).collect();
+        request_missing(input.images, prefetched, &layout, input.notify);
+    }
+    evict(if smooth { count } else { real_indices.len() + PREFETCH * 2 + 4 });
 
     if let Ok(mut guard) = TILES.lock() {
         if let Some(cache) = guard.as_mut() {
             cache.tick += 1;
             let tick = cache.tick;
-            for img in &input.images[visible.clone()] {
+            for index in &real_indices {
+                let img = &input.images[*index];
                 if let Some(entry) = cache.tiles.get_mut(img.path.to_string_lossy().as_ref()) { entry.1 = tick; }
             }
         }
     }
 
     let scale_of = |index: usize| input.scales.get(index).copied().unwrap_or(1.0);
-    let mut order: Vec<usize> = visible.collect();
-    order.sort_by(|a, b| scale_of(*a).total_cmp(&scale_of(*b)));
+    let mut order = virtuals;
+    order.sort_by(|a, b| scale_of(a.rem_euclid(count as i64) as usize).total_cmp(&scale_of(b.rem_euclid(count as i64) as usize)));
 
     let src_dc = CreateCompatibleDC(dc);
     let shade_dc = CreateCompatibleDC(dc);
@@ -319,11 +367,12 @@ pub unsafe fn paint(dc: HDC, width: i32, height: i32, input: &PaintInput) {
     let _ = DeleteObject(black);
     let tiles = TILES.lock().ok();
 
-    for index in order {
+    for virtual_index in order {
+        let index = virtual_index.rem_euclid(count as i64) as usize;
         let img = &input.images[index];
         let scale = scale_of(index);
         let focus_amount = ((scale - 1.0) / (FOCUS_SCALE - 1.0)).clamp(0.0, 1.0);
-        let x = layout.tile_x(index, count, width, input.scroll);
+        let x = layout.loop_tile_x(virtual_index, input.scroll);
         let (points, rect) = layout.polygon(x, scale);
         let (dest_w, dest_h) = (rect.right - rect.left, rect.bottom - rect.top);
         let region = CreatePolygonRgn(&points, ALTERNATE);

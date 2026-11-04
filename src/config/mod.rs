@@ -25,6 +25,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub panel_mode: PanelMode,
     #[serde(default)]
+    pub pro_priority: ProPriority,
+    #[serde(default)]
     pub thumb_loading: ThumbLoading,
     /// Cambiar el fondo con el fundido nativo de Windows.
     #[serde(default = "default_wallpaper_fade")]
@@ -65,6 +67,17 @@ pub enum PanelMode {
     LowPower,
     /// Carrusel de tarjetas inclinadas en el centro de la pantalla.
     Pro,
+}
+
+/// Prioridad de carga del carrusel Pro.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ProPriority {
+    /// Precarga las tarjetas grandes de toda la galería para evitar esperas al navegar.
+    Smooth,
+    /// Conserva en memoria solo las tarjetas cercanas al área visible.
+    #[default]
+    Performance,
 }
 
 /// Cuándo se generan las miniaturas pequeñas de la galería.
@@ -264,6 +277,7 @@ impl Default for AppConfig {
             zones: ZoneConfig::default(),
             panel_side: PanelSide::Top,
             panel_mode: PanelMode::LowPower,
+            pro_priority: ProPriority::Performance,
             thumb_loading: ThumbLoading::Preload,
             wallpaper_fade: default_wallpaper_fade(),
             show_scrollbar: true,

@@ -1,4 +1,4 @@
-use crate::config::{AppConfig, PanelMode, PanelSide, ThumbLoading};
+use crate::config::{AppConfig, PanelMode, PanelSide, ProPriority, ThumbLoading};
 use crate::log_info;
 use crate::winutil::{as_pcwstr, to_wide_chars};
 use std::sync::{Arc, Mutex};
@@ -31,6 +31,7 @@ const IDC_LANGUAGE_COMBO: i32 = 1016;
 const IDC_PANEL_MODE_COMBO: i32 = 1021;
 const IDC_THUMB_LOADING_COMBO: i32 = 1022;
 const IDC_FADE_CHK: i32 = 1023;
+const IDC_PRO_PRIORITY_COMBO: i32 = 1024;
 const IDC_HOTKEY_PANEL: i32 = 1025;
 const IDC_HOTKEY_PREVIOUS: i32 = 1026;
 const IDC_HOTKEY_NEXT: i32 = 1027;
@@ -101,14 +102,14 @@ const CARD_X: i32 = 12;
 const CARD_W: i32 = 620;
 const SECTIONS: [(&str, i32, i32); 4] = [
     ("Wallpaper folder:", 12, 86),
-    ("Thumbnail panel", 110, 202),
-    ("General", 324, 138),
-    ("Keyboard shortcuts", 474, 106),
+    ("Thumbnail panel", 110, 242),
+    ("General", 374, 138),
+    ("Keyboard shortcuts", 524, 106),
 ];
 /// Marco del campo de la carpeta (el EDIT va dentro, sin borde propio).
 const FOLDER_FIELD: (i32, i32, i32, i32) = (28, 52, 456, 32);
 const CLIENT_W: i32 = 644;
-const CLIENT_H: i32 = 640;
+const CLIENT_H: i32 = 690;
 const COL_1: i32 = 28;
 const COL_2: i32 = 334;
 const COL_W: i32 = 282;
@@ -149,21 +150,23 @@ unsafe fn create_config_controls(hwnd: HWND) {
     label(tr("Thumbnail loading:"), COL_2, 212, COL_W);
     add_combo(IDC_THUMB_LOADING_COMBO, COL_2, 232, COL_W, &[tr("All in advance"), tr("On demand (less memory)")]);
     add_checkbox("Show scrollbar", IDC_SCROLLBAR_CHK, COL_1, 274);
+    label(tr("Pro mode priority:"), COL_2, 274, COL_W);
+    add_combo(IDC_PRO_PRIORITY_COMBO, COL_2, 294, COL_W, &[tr("Smooth (higher memory use)"), tr("Performance (lower memory use)")]);
 
     // General
-    add_checkbox("Detection enabled", IDC_DETECTION_CHK, COL_1, 364);
-    add_checkbox("Scan subfolders", IDC_SUBFOLDERS_CHK, COL_1, 394);
-    add_checkbox("Start with Windows", IDC_AUTOSTART_CHK, COL_1, 424);
-    label(tr("Language:"), COL_2, 364, COL_W);
+    add_checkbox("Detection enabled", IDC_DETECTION_CHK, COL_1, 414);
+    add_checkbox("Scan subfolders", IDC_SUBFOLDERS_CHK, COL_1, 444);
+    add_checkbox("Start with Windows", IDC_AUTOSTART_CHK, COL_1, 474);
+    label(tr("Language:"), COL_2, 414, COL_W);
     let mut options = vec!["auto".to_string()];
     let mut language_items = vec![tr("Automatic (Windows)")];
     for (code, name) in crate::i18n::available_languages() {
         language_items.push(to_wide_chars(&name));
         options.push(code);
     }
-    add_combo(IDC_LANGUAGE_COMBO, COL_2, 384, COL_W, &language_items);
+    add_combo(IDC_LANGUAGE_COMBO, COL_2, 434, COL_W, &language_items);
     if let Ok(mut stored) = LANGUAGE_OPTIONS.lock() { *stored = options; }
-    add_checkbox("Fade when changing wallpaper", IDC_FADE_CHK, COL_2, 424);
+    add_checkbox("Fade when changing wallpaper", IDC_FADE_CHK, COL_2, 474);
 
     // Atajos de teclado
     let hotkeys = CONFIG_STATE.lock().ok().and_then(|g| g.clone())
@@ -175,16 +178,16 @@ unsafe fn create_config_controls(hwnd: HWND) {
         ("Next wallpaper:", IDC_HOTKEY_NEXT, &hotkeys.next_wallpaper),
     ].into_iter().enumerate() {
         let x = COL_1 + index as i32 * 200;
-        label(tr(text), x, 514, 188);
-        let control = add_control(hwnd, super::hotkey_field::CLASS_NAME, &to_wide_chars(""), id, x, 534, 188, 32, TAB_STOP);
+        label(tr(text), x, 564, 188);
+        let control = add_control(hwnd, super::hotkey_field::CLASS_NAME, &to_wide_chars(""), id, x, 584, 188, 32, TAB_STOP);
         let _ = SendMessageW(control, HKM_SETHOTKEY, WPARAM(binding.to_hotkey_value() as usize), LPARAM(0));
     }
 
     // Pie
     const SS_CENTERIMAGE: u32 = 0x0200;
-    add_control(hwnd, "STATIC", &tr("Changes apply after saving."), IDC_FOOTER_NOTE, 16, 594, 372, 32, SS_CENTERIMAGE);
-    style_button(add_control(hwnd, "BUTTON", &tr("Cancel"), IDC_CANCEL_BTN, 404, 594, 102, 32, TAB_STOP), false, false);
-    style_button(add_control(hwnd, "BUTTON", &tr("Save"), IDC_APPLY_BTN, 514, 594, 102, 32, TAB_STOP), true, false);
+    add_control(hwnd, "STATIC", &tr("Changes apply after saving."), IDC_FOOTER_NOTE, 16, 644, 372, 32, SS_CENTERIMAGE);
+    style_button(add_control(hwnd, "BUTTON", &tr("Cancel"), IDC_CANCEL_BTN, 404, 644, 102, 32, TAB_STOP), false, false);
+    style_button(add_control(hwnd, "BUTTON", &tr("Save"), IDC_APPLY_BTN, 514, 644, 102, 32, TAB_STOP), true, false);
 }
 
 /// Fondo de la ventana: tarjetas de cada sección y el marco del campo de la carpeta.
@@ -265,6 +268,9 @@ unsafe fn update_mode_dependent_controls(hwnd: HWND) {
     let pro = GetDlgItem(hwnd, IDC_PANEL_MODE_COMBO).map(|combo| combo_selection(combo) == 1).unwrap_or(false);
     if let Ok(chk) = GetDlgItem(hwnd, IDC_SCROLLBAR_CHK) {
         let _ = windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow(chk, !pro);
+    }
+    if let Ok(label) = GetDlgItem(hwnd, IDC_PRO_PRIORITY_COMBO) {
+        let _ = windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow(label, pro);
     }
 }
 
@@ -376,6 +382,10 @@ unsafe extern "system" fn config_wnd_proc(
                     }
                     if let Ok(combo) = GetDlgItem(hwnd, IDC_PANEL_MODE_COMBO) {
                         let selection = if config.panel_mode == PanelMode::Pro { 1 } else { 0 };
+                        let _ = SendMessageW(combo, windows::Win32::UI::WindowsAndMessaging::CB_SETCURSEL, WPARAM(selection), LPARAM(0));
+                    }
+                    if let Ok(combo) = GetDlgItem(hwnd, IDC_PRO_PRIORITY_COMBO) {
+                        let selection = if config.pro_priority == ProPriority::Performance { 1 } else { 0 };
                         let _ = SendMessageW(combo, windows::Win32::UI::WindowsAndMessaging::CB_SETCURSEL, WPARAM(selection), LPARAM(0));
                     }
                     update_mode_dependent_controls(hwnd);
@@ -522,6 +532,9 @@ unsafe extern "system" fn config_wnd_proc(
                             }
                             if let Ok(combo) = GetDlgItem(hwnd, IDC_PANEL_MODE_COMBO) {
                                 config.panel_mode = if combo_selection(combo) == 1 { PanelMode::Pro } else { PanelMode::LowPower };
+                            }
+                            if let Ok(combo) = GetDlgItem(hwnd, IDC_PRO_PRIORITY_COMBO) {
+                                config.pro_priority = if combo_selection(combo) == 1 { ProPriority::Performance } else { ProPriority::Smooth };
                             }
                             if let Ok(chk) = GetDlgItem(hwnd, IDC_SCROLLBAR_CHK) {
                                 use windows::Win32::UI::WindowsAndMessaging::BM_GETCHECK;

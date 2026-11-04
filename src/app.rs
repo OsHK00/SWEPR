@@ -408,6 +408,7 @@ unsafe extern "system" fn wnd_proc(
                 {
                     let config = state.config.lock().unwrap();
                     panel::set_thumbnail_loading(config.thumb_loading == ThumbLoading::OnDemand, config.thumb_size_value() as i32);
+                    panel::set_pro_priority(config.pro_priority);
                 }
                 panel::clear_carousel_tiles();
                 let (by_date, wallpaper_dir, scan_subfolders, detection_enabled, panel_side, panel_mode, show_scrollbar, panel_margin, language, mut zones) = {
@@ -546,6 +547,7 @@ impl App {
         crate::i18n::set_language(config.language.clone());
         panel::set_panel_side(config.panel_side);
         panel::set_panel_mode(config.panel_mode);
+        panel::set_pro_priority(config.pro_priority);
         panel::set_thumbnail_loading(config.thumb_loading == ThumbLoading::OnDemand, config.thumb_size_value() as i32);
         panel::set_scrollbar_visible(config.show_scrollbar);
         panel::set_panel_margin(config.panel_margin);

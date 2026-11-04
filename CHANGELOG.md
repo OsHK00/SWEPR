@@ -2,6 +2,12 @@
 
 This file tracks user-facing changes between releases. Commits do not imply a new release.
 
+## Unreleased
+
+### Added
+
+- Pro mode can prioritize smooth navigation by preloading all large carousel cards, or prioritize lower memory use by keeping only nearby cards cached.
+
 ## [1.1.0]
 
 ### Improved
