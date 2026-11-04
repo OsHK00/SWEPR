@@ -28,8 +28,29 @@ pub struct TrayIcon {
     is_added: bool,
 }
 
+/// Hace que los menús emergentes sigan el tema oscuro/claro de Windows.
+/// Usa las funciones sin nombre de uxtheme.dll (ordinales 135 y 136, Windows 10 1903+);
+/// si no existen, el menú se queda con el estilo claro de siempre.
+fn follow_system_menu_theme() {
+    use windows::core::PCSTR;
+    use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+    unsafe {
+        let Ok(uxtheme) = LoadLibraryW(windows::core::w!("uxtheme.dll")) else { return; };
+        let set_preferred_app_mode = GetProcAddress(uxtheme, PCSTR(135 as *const u8));
+        let flush_menu_themes = GetProcAddress(uxtheme, PCSTR(136 as *const u8));
+        if let (Some(set_mode), Some(flush)) = (set_preferred_app_mode, flush_menu_themes) {
+            let set_mode: unsafe extern "system" fn(i32) -> i32 = std::mem::transmute(set_mode);
+            let flush: unsafe extern "system" fn() = std::mem::transmute(flush);
+            const ALLOW_DARK: i32 = 1;
+            set_mode(ALLOW_DARK);
+            flush();
+        }
+    }
+}
+
 impl TrayIcon {
     pub fn new(hwnd: HWND) -> Self {
+        follow_system_menu_theme();
         Self {
             hwnd,
             is_added: false,

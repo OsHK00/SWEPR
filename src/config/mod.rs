@@ -20,6 +20,8 @@ pub struct AppConfig {
     pub zones: ZoneConfig,
     #[serde(default)]
     pub panel_side: PanelSide,
+    #[serde(default)]
+    pub panel_mode: PanelMode,
     #[serde(default = "default_show_scrollbar")]
     pub show_scrollbar: bool,
     #[serde(default = "default_panel_margin")]
@@ -44,6 +46,17 @@ pub enum PanelSide {
 
 impl Default for PanelSide {
     fn default() -> Self { Self::Top }
+}
+
+/// Estilo del panel de miniaturas.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PanelMode {
+    /// Tira de miniaturas en un borde: lo más ligero.
+    #[default]
+    LowPower,
+    /// Carrusel de tarjetas inclinadas en el centro de la pantalla.
+    Pro,
 }
 
 impl PanelSide {
@@ -111,6 +124,7 @@ impl Default for AppConfig {
             thumb_size: 128,
             zones: ZoneConfig::default(),
             panel_side: PanelSide::Top,
+            panel_mode: PanelMode::LowPower,
             show_scrollbar: true,
             panel_margin: default_panel_margin(),
             language: default_language(),
@@ -154,6 +168,10 @@ impl AppConfig {
                         .ok()
                         .and_then(|value| value.get("panel_side").cloned())
                         .is_some();
+                    let has_panel_mode = serde_json::from_str::<serde_json::Value>(&contents)
+                        .ok()
+                        .and_then(|value| value.get("panel_mode").cloned())
+                        .is_some();
                     let has_show_scrollbar = serde_json::from_str::<serde_json::Value>(&contents)
                         .ok()
                         .and_then(|value| value.get("show_scrollbar").cloned())
@@ -170,7 +188,7 @@ impl AppConfig {
                         .ok()
                         .map(|value| value.get("acrylic_enabled").is_some() || value.get("acrylic_opacity").is_some())
                         .unwrap_or(false);
-                    if !has_all_hotkeys || !has_panel_side || !has_show_scrollbar || !has_panel_margin || !has_language || has_legacy_acrylic || zones_changed {
+                    if !has_all_hotkeys || !has_panel_side || !has_panel_mode || !has_show_scrollbar || !has_panel_margin || !has_language || has_legacy_acrylic || zones_changed {
                         let _ = config.save();
                     }
                     log_info!("Configuración general cargada desde {:?}", path);

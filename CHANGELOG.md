@@ -7,8 +7,15 @@ This file tracks user-facing changes between releases. Commits do not imply a ne
 ### Improved
 
 - Redesigned the settings window with a dark theme, clearer grouping, and shorter thumbnail size labels.
+- The settings window uses the Windows interface font and scales with the display DPI; the thumbnail panel also scales with the DPI of its monitor.
+- Clearer thumbnail states: white outline for the focused wallpaper, blue outline for the current one, and a green dot for new ones.
+- The thumbnail panel only draws the visible thumbnails.
+- The tray menu follows the Windows dark or light theme.
 
 ### Added
+
+- Panel mode setting: Low power (the thumbnail strip) or Pro, a carousel of slanted wallpaper cards in the middle of the screen with the focused card enlarged. Pro loads large cards only for the visible wallpapers and releases them 30 seconds after the panel closes.
+- A message in the panel when the wallpaper folder has no images.
 
 
 ## [1.0.0]

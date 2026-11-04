@@ -81,6 +81,78 @@ impl Drop for ThumbnailCache {
     }
 }
 
+/// Genera un bitmap de 24 bits de exactamente `width`x`height` que cubre el área recortando
+/// el centro de la imagen. Solo se guarda el recorte, sin el bitmap intermedio del Shell.
+/// Requiere COM inicializado en el hilo que llama.
+pub unsafe fn load_cover_bitmap(path: &Path, width: i32, height: i32) -> Option<Thumb> {
+    use windows::Win32::Graphics::Gdi::{
+        CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetObjectW, SelectObject, SetBrushOrgEx,
+        SetStretchBltMode, StretchBlt, BITMAP, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, HALFTONE, HGDIOBJ, SRCCOPY,
+    };
+    if width <= 0 || height <= 0 { return None; }
+    let path_wide: Vec<u16> = path.to_string_lossy().encode_utf16().chain(std::iter::once(0)).collect();
+    let shell_item = SHCreateItemFromParsingName::<PCWSTR, Option<&windows::Win32::System::Com::IBindCtx>, IShellItem>(
+        PCWSTR(path_wide.as_ptr()),
+        None,
+    ).ok()?;
+    let factory = shell_item.cast::<IShellItemImageFactory>().ok()?;
+    // Caja ancha: las imágenes horizontales se ajustan por alto y luego se recortan a lo ancho.
+    let request = windows::Win32::Foundation::SIZE { cx: width.max(height * 3), cy: height };
+    let source = match factory.GetImage(request, SIIGBF_RESIZETOFIT) {
+        Ok(bmp) => bmp,
+        Err(e) => {
+            log_warn!("GetImage (carrusel) fallo para {:?}: {e:?}", path);
+            return None;
+        }
+    };
+    let mut info = BITMAP::default();
+    let read = GetObjectW(HGDIOBJ(source.0), std::mem::size_of::<BITMAP>() as i32, Some(&mut info as *mut _ as *mut std::ffi::c_void));
+    if read == 0 || info.bmWidth <= 0 || info.bmHeight <= 0 {
+        let _ = DeleteObject(HGDIOBJ(source.0));
+        return None;
+    }
+    let (src_w, src_h) = (info.bmWidth, info.bmHeight.abs());
+    let (crop_x, crop_y, crop_w, crop_h) = if src_w * height > src_h * width {
+        let crop_w = (src_h * width / height).max(1);
+        ((src_w - crop_w) / 2, 0, crop_w, src_h)
+    } else {
+        let crop_h = (src_w * height / width).max(1);
+        (0, (src_h - crop_h) / 2, src_w, crop_h)
+    };
+
+    let header = BITMAPINFOHEADER {
+        biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+        biWidth: width,
+        biHeight: -height,
+        biPlanes: 1,
+        biBitCount: 24,
+        ..Default::default()
+    };
+    let bitmap_info = BITMAPINFO { bmiHeader: header, ..Default::default() };
+    let mut bits = std::ptr::null_mut();
+    let target = CreateDIBSection(None, &bitmap_info, DIB_RGB_COLORS, &mut bits, None, 0).ok()?;
+
+    let src_dc = CreateCompatibleDC(None);
+    let dst_dc = CreateCompatibleDC(None);
+    let old_src = SelectObject(src_dc, HGDIOBJ(source.0));
+    let old_dst = SelectObject(dst_dc, HGDIOBJ(target.0));
+    let _ = SetStretchBltMode(dst_dc, HALFTONE);
+    let _ = SetBrushOrgEx(dst_dc, 0, 0, None);
+    let _ = StretchBlt(dst_dc, 0, 0, width, height, src_dc, crop_x, crop_y, crop_w, crop_h, SRCCOPY);
+    SelectObject(src_dc, old_src);
+    SelectObject(dst_dc, old_dst);
+    let _ = DeleteDC(src_dc);
+    let _ = DeleteDC(dst_dc);
+    let _ = DeleteObject(HGDIOBJ(source.0));
+
+    Some(Thumb {
+        path_key: path.to_string_lossy().to_string(),
+        hbitmap: target.0 as isize,
+        width,
+        height,
+    })
+}
+
 pub fn request_thumbnail<P: AsRef<Path>>(hwnd: HWND, path: P, size_px: i32, cache: ThumbnailCache) {
     let path_buf = path.as_ref().to_path_buf();
     let hwnd_val = hwnd.0 as isize;

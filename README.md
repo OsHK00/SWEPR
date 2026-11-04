@@ -14,12 +14,12 @@ SWEPR runs in the system tray and lets you browse a folder of images, preview th
 ## Features
 
 - Scans a wallpaper folder for JPG, JPEG, PNG, and BMP images, with optional subfolder scanning.
-- Opens a thumbnail panel from screen edge sensors or a keyboard shortcut. The panel can be positioned at the top, left, or right edge of the screen.
+- Opens a thumbnail panel from screen edge sensors or a keyboard shortcut. Two panel modes are available: Low power, a thumbnail strip at the top, left, or right edge of the screen, and Pro, a carousel of slanted cards in the center.
 - Highlights newly discovered images in green and places them at the beginning of the gallery.
 - Applies a selected wallpaper and lets you move through the collection with keyboard shortcuts.
 - Provides tray menu actions for refreshing the gallery, opening the wallpaper folder, changing settings, and exiting.
 - Supports English and Spanish translations. The language can be selected in Settings; additional translation files can be added to the `languages` folder.
-- Offers settings for the wallpaper folder, subfolder scanning, Windows startup, panel position, scrollbar visibility, and thumbnail size.
+- Offers settings for the wallpaper folder, subfolder scanning, Windows startup, panel mode, panel position, scrollbar visibility, and thumbnail size.
 
 ## Panel demos
 
