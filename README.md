@@ -11,6 +11,22 @@
 
 SWEPR runs in the system tray and lets you browse a folder of images, preview them in a thumbnail panel, and apply a wallpaper without opening a separate desktop app.
 
+## Panel demos
+
+### Pro mode
+
+![Capture of the Pro mode carousel](resources/demos/demo-pro.png)
+
+![Demo of the Pro mode carousel](resources/demos/demo-pro.gif)
+
+### Panel at the top
+
+![Demo of the thumbnail panel at the top of the screen](resources/demos/panel-top-demo.gif)
+
+### Changing the panel position
+
+![Demo of changing the panel position in Settings](resources/demos/panel-position-demo.gif)
+
 ## Features
 
 - Scans a wallpaper folder for JPG, JPEG, JFIF, PNG, BMP, WebP, GIF, and TIFF images, with optional subfolder scanning. The gallery can be sorted by name or by date.
@@ -28,16 +44,6 @@ SWEPR runs in the system tray and lets you browse a folder of images, preview th
 - Left-click the tray icon to open the panel. The tray menu offers next, random, and previous wallpaper, refreshing the gallery, opening the wallpaper folder, settings, and exit.
 - Supports English and Spanish translations. The language can be selected in Settings; additional translation files can be added to the `languages` folder.
 - Offers a dark Settings window for the wallpaper folder, subfolder scanning, Windows startup, the fit mode, gallery order, automatic changes, the wallpaper fade, panel mode, panel position, scrollbar visibility, thumbnail size and loading, and keyboard shortcuts. The window rescales when moved to a monitor with a different DPI.
-
-## Panel demos
-
-### Panel at the top
-
-![Demo of the thumbnail panel at the top of the screen](resources/demos/panel-top-demo.gif)
-
-### Changing the panel position
-
-![Demo of changing the panel position in Settings](resources/demos/panel-position-demo.gif)
 
 ## Installing and updating
 
@@ -79,7 +85,9 @@ Translation files are JSON files in `languages`, named with a language code such
 │   ├── swepr.rc             Windows icon resource definition (version info is added at build time)
 │   └── demos/               README demo GIFs
 │       ├── panel-top-demo.gif
-│       └── panel-position-demo.gif
+│       ├── panel-position-demo.gif
+│       ├── demo-pro.gif     Pro mode carousel demo
+│       └── demo-pro.png     Pro mode carousel capture
 ├── src/
 │   ├── app.rs               Application startup, events, and coordination
 │   ├── canvas/
