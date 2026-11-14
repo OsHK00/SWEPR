@@ -1,4 +1,4 @@
-use crate::config::{AppConfig, PanelMode, PanelSide, ProPriority, ThumbLoading};
+use crate::config::{AppConfig, ApplyMode, FitMode, Transition, PanelMode, PanelSide, ProPriority, SortOrder, ThumbLoading};
 use crate::log_info;
 use crate::winutil::{as_pcwstr, to_wide_chars};
 use std::sync::{Arc, Mutex};
@@ -30,17 +30,33 @@ const IDC_SCROLLBAR_CHK: i32 = 1015;
 const IDC_LANGUAGE_COMBO: i32 = 1016;
 const IDC_PANEL_MODE_COMBO: i32 = 1021;
 const IDC_THUMB_LOADING_COMBO: i32 = 1022;
-const IDC_FADE_CHK: i32 = 1023;
+/// Cambio de fondo: Windows sin fundido, Windows con fundido o lienzo de SWEPR.
+const IDC_APPLY_MODE_COMBO: i32 = 1023;
+const IDC_TRANSITION_COMBO: i32 = 1035;
+const IDC_TRANSITION_EFFECT_COMBO: i32 = 1036;
 const IDC_PRO_PRIORITY_COMBO: i32 = 1024;
 const IDC_HOTKEY_PANEL: i32 = 1025;
 const IDC_HOTKEY_PREVIOUS: i32 = 1026;
 const IDC_HOTKEY_NEXT: i32 = 1027;
+const IDC_FIT_MODE_COMBO: i32 = 1028;
+const IDC_SORT_COMBO: i32 = 1029;
+const IDC_ROTATION_COMBO: i32 = 1030;
+const IDC_SHUFFLE_CHK: i32 = 1031;
+const IDC_FAVORITES_ONLY_CHK: i32 = 1032;
+const IDC_PER_MONITOR_CHK: i32 = 1033;
+const IDC_HIDDEN_BTN: i32 = 1034;
+
+/// Mensaje propio: el hilo del diálogo "Examinar" terminó (con o sin carpeta elegida).
+const WM_APP_FOLDER_PICKED: u32 = windows::Win32::UI::WindowsAndMessaging::WM_USER + 100;
+const WM_DPICHANGED: u32 = 0x02E0;
 
 use super::hotkey_field::{HKM_GETHOTKEY, HKM_SETHOTKEY};
 
 static CONFIG_HWND: Mutex<Option<isize>> = Mutex::new(None);
 static CONFIG_STATE: Mutex<Option<Arc<Mutex<AppConfig>>>> = Mutex::new(None);
 static PENDING_FOLDER_PATH: Mutex<Option<String>> = Mutex::new(None);
+/// Hay un diálogo "Examinar" abierto (solo se permite uno).
+static BROWSE_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static LANGUAGE_OPTIONS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 /// DPI de la ventana; el layout se escribe en píxeles a 96 DPI y se escala con `px`.
 static CONFIG_DPI: Mutex<u32> = Mutex::new(96);
@@ -80,6 +96,8 @@ fn hmenu(id: i32) -> windows::Win32::UI::WindowsAndMessaging::HMENU {
 
 fn tr(key: &str) -> Vec<u16> { to_wide_chars(&crate::i18n::t(key)) }
 
+/// Crea un control hijo con la posición y el tamaño dados a 96 DPI (se escalan con `px`).
+#[allow(clippy::too_many_arguments)]
 unsafe fn add_control(hwnd: HWND, class: &str, text: &[u16], id: i32, x: i32, y: i32, width: i32, height: i32, extra_style: u32) -> HWND {
     let style = windows::Win32::UI::WindowsAndMessaging::WS_CHILD
         | windows::Win32::UI::WindowsAndMessaging::WS_VISIBLE
@@ -97,23 +115,28 @@ unsafe fn add_control(hwnd: HWND, class: &str, text: &[u16], id: i32, x: i32, y:
     control
 }
 
-/// Tarjetas de la ventana (título, y, alto) en píxeles a 96 DPI; todas van de CARD_X a CARD_X + CARD_W.
-const CARD_X: i32 = 12;
-const CARD_W: i32 = 620;
-const SECTIONS: [(&str, i32, i32); 4] = [
-    ("Wallpaper folder:", 12, 86),
-    ("Thumbnail panel", 110, 242),
-    ("General", 374, 138),
-    ("Keyboard shortcuts", 524, 106),
+/// Tarjetas de la ventana (título, x, y, ancho, alto) en píxeles a 96 DPI.
+const SECTIONS: [(&str, i32, i32, i32, i32); 5] = [
+    ("Wallpaper folder:", 12, 12, 920, 86),
+    ("Thumbnail panel", 12, 110, 620, 242),
+    ("General", 12, 374, 620, 146),
+    ("Wallpaper", 644, 110, 288, 410),
+    ("Keyboard shortcuts", 12, 532, 920, 106),
 ];
 /// Marco del campo de la carpeta (el EDIT va dentro, sin borde propio).
-const FOLDER_FIELD: (i32, i32, i32, i32) = (28, 52, 456, 32);
-const CLIENT_W: i32 = 644;
-const CLIENT_H: i32 = 690;
+const FOLDER_FIELD: (i32, i32, i32, i32) = (28, 52, 756, 32);
+const CLIENT_W: i32 = 944;
+const CLIENT_H: i32 = 698;
 const COL_1: i32 = 28;
 const COL_2: i32 = 334;
+const COL_3: i32 = 660;
 const COL_W: i32 = 282;
+const COL_3_W: i32 = 256;
 const THUMB_SIZES: [u32; 4] = [64, 128, 256, 512];
+/// Intervalos de rotación automática en minutos (0 = desactivada).
+const ROTATION_MINUTES: [u32; 8] = [0, 5, 15, 30, 60, 180, 720, 1440];
+/// Duraciones de la transición del lienzo, en milisegundos.
+const TRANSITION_MS: [u32; 4] = [300, 600, 1000, 1500];
 
 unsafe fn create_config_controls(hwnd: HWND) {
     use super::theme::{style_button, style_checkbox, style_combo};
@@ -129,16 +152,17 @@ unsafe fn create_config_controls(hwnd: HWND) {
         style_combo(combo);
         combo
     };
-    let add_checkbox = |text: &str, id: i32, x: i32, y: i32| {
-        style_checkbox(add_control(hwnd, "BUTTON", &tr(text), id, x, y, COL_W, 24, CHECKBOX | TAB_STOP));
+    let add_checkbox_w = |text: &str, id: i32, x: i32, y: i32, width: i32| {
+        style_checkbox(add_control(hwnd, "BUTTON", &tr(text), id, x, y, width, 24, CHECKBOX | TAB_STOP));
     };
+    let add_checkbox = |text: &str, id: i32, x: i32, y: i32| add_checkbox_w(text, id, x, y, COL_W);
     let label = |text: Vec<u16>, x: i32, y: i32, width: i32| { add_control(hwnd, "STATIC", &text, 0, x, y, width, 18, 0); };
     let with_colon = |key: &str| to_wide_chars(&format!("{}:", crate::i18n::t(key).trim_end_matches(':')));
 
     // Carpeta
     let (fx, fy, fw, fh) = FOLDER_FIELD;
     add_control(hwnd, "EDIT", &to_wide_chars(""), IDC_FOLDER_EDIT, fx + 10, fy + (fh - 18) / 2, fw - 20, 18, TAB_STOP | AUTO_HORIZONTAL_SCROLL);
-    style_button(add_control(hwnd, "BUTTON", &tr("Browse..."), IDC_FOLDER_BTN, 494, fy, 122, fh, TAB_STOP), false, true);
+    style_button(add_control(hwnd, "BUTTON", &tr("Browse..."), IDC_FOLDER_BTN, 794, fy, 122, fh, TAB_STOP), false, true);
 
     // Panel de miniaturas
     label(tr("Panel mode:"), COL_1, 150, COL_W);
@@ -166,7 +190,28 @@ unsafe fn create_config_controls(hwnd: HWND) {
     }
     add_combo(IDC_LANGUAGE_COMBO, COL_2, 434, COL_W, &language_items);
     if let Ok(mut stored) = LANGUAGE_OPTIONS.lock() { *stored = options; }
-    add_checkbox("Fade when changing wallpaper", IDC_FADE_CHK, COL_2, 474);
+
+    // Fondo de pantalla
+    label(tr("Fit:"), COL_3, 150, COL_3_W);
+    add_combo(IDC_FIT_MODE_COMBO, COL_3, 170, COL_3_W, &[tr("Fill"), tr("Fit"), tr("Stretch"), tr("Center"), tr("Tile"), tr("Span (all monitors)")]);
+    label(tr("Gallery order:"), COL_3, 212, COL_3_W);
+    add_combo(IDC_SORT_COMBO, COL_3, 232, COL_3_W, &[tr("Name"), tr("Date (newest first)")]);
+    label(tr("Change wallpaper automatically:"), COL_3, 274, COL_3_W);
+    add_combo(IDC_ROTATION_COMBO, COL_3, 294, COL_3_W, &[
+        tr("Never"), tr("Every 5 minutes"), tr("Every 15 minutes"), tr("Every 30 minutes"),
+        tr("Every hour"), tr("Every 3 hours"), tr("Every 12 hours"), tr("Every day"),
+    ]);
+    label(tr("Wallpaper change:"), COL_3, 336, COL_3_W);
+    add_combo(IDC_APPLY_MODE_COMBO, COL_3, 356, COL_3_W, &[tr("Windows, instant"), tr("Windows, fade"), tr("SWEPR canvas")]);
+    // Efecto y duración de la transición del lienzo (en el orden de Transition::ALL).
+    add_combo(IDC_TRANSITION_EFFECT_COMBO, COL_3, 398, 172, &[
+        tr("Fade"), tr("Slide"), tr("Zoom in"), tr("Wipe"), tr("Circle"), tr("Random effect"),
+    ]);
+    add_combo(IDC_TRANSITION_COMBO, COL_3 + 180, 398, COL_3_W - 180, &[tr("0.3 s"), tr("0.6 s"), tr("1 s"), tr("1.5 s")]);
+    add_checkbox_w("Random order", IDC_SHUFFLE_CHK, COL_3, 440, COL_3_W);
+    add_checkbox_w("Rotate only favorites", IDC_FAVORITES_ONLY_CHK, COL_3, 466, COL_3_W);
+    add_checkbox_w("Different wallpaper on each monitor", IDC_PER_MONITOR_CHK, COL_3, 492, COL_3_W);
+    style_button(add_control(hwnd, "BUTTON", &tr("Removed images..."), IDC_HIDDEN_BTN, COL_2, 472, COL_W, 30, TAB_STOP), false, true);
 
     // Atajos de teclado
     let hotkeys = CONFIG_STATE.lock().ok().and_then(|g| g.clone())
@@ -177,17 +222,17 @@ unsafe fn create_config_controls(hwnd: HWND) {
         ("Previous wallpaper:", IDC_HOTKEY_PREVIOUS, &hotkeys.previous_wallpaper),
         ("Next wallpaper:", IDC_HOTKEY_NEXT, &hotkeys.next_wallpaper),
     ].into_iter().enumerate() {
-        let x = COL_1 + index as i32 * 200;
-        label(tr(text), x, 564, 188);
-        let control = add_control(hwnd, super::hotkey_field::CLASS_NAME, &to_wide_chars(""), id, x, 584, 188, 32, TAB_STOP);
+        let x = COL_1 + index as i32 * 300;
+        label(tr(text), x, 572, 280);
+        let control = add_control(hwnd, super::hotkey_field::CLASS_NAME, &to_wide_chars(""), id, x, 592, 280, 32, TAB_STOP);
         let _ = SendMessageW(control, HKM_SETHOTKEY, WPARAM(binding.to_hotkey_value() as usize), LPARAM(0));
     }
 
     // Pie
     const SS_CENTERIMAGE: u32 = 0x0200;
-    add_control(hwnd, "STATIC", &tr("Changes apply after saving."), IDC_FOOTER_NOTE, 16, 644, 372, 32, SS_CENTERIMAGE);
-    style_button(add_control(hwnd, "BUTTON", &tr("Cancel"), IDC_CANCEL_BTN, 404, 644, 102, 32, TAB_STOP), false, false);
-    style_button(add_control(hwnd, "BUTTON", &tr("Save"), IDC_APPLY_BTN, 514, 644, 102, 32, TAB_STOP), true, false);
+    add_control(hwnd, "STATIC", &tr("Changes apply after saving."), IDC_FOOTER_NOTE, 16, 652, 672, 32, SS_CENTERIMAGE);
+    style_button(add_control(hwnd, "BUTTON", &tr("Cancel"), IDC_CANCEL_BTN, 704, 652, 102, 32, TAB_STOP), false, false);
+    style_button(add_control(hwnd, "BUTTON", &tr("Save"), IDC_APPLY_BTN, 814, 652, 102, 32, TAB_STOP), true, false);
 }
 
 /// Fondo de la ventana: tarjetas de cada sección y el marco del campo de la carpeta.
@@ -197,8 +242,8 @@ unsafe fn paint_background(hwnd: HWND, dc: HDC) {
     let _ = windows::Win32::UI::WindowsAndMessaging::GetClientRect(hwnd, &mut client);
     let _ = FillRect(dc, &client, super::theme::brush(super::theme::COLOR_WINDOW_BG));
     let title_font = CONFIG_TITLE_FONT.lock().ok().and_then(|g| *g).unwrap_or(0);
-    for (title, y, height) in SECTIONS {
-        let rect = RECT { left: px(CARD_X), top: px(y), right: px(CARD_X + CARD_W), bottom: px(y + height) };
+    for (title, x, y, width, height) in SECTIONS {
+        let rect = RECT { left: px(x), top: px(y), right: px(x + width), bottom: px(y + height) };
         super::theme::draw_card(dc, &rect, crate::i18n::t(title).trim_end_matches(':'), title_font);
     }
     let (fx, fy, fw, fh) = FOLDER_FIELD;
@@ -269,9 +314,93 @@ unsafe fn update_mode_dependent_controls(hwnd: HWND) {
     if let Ok(chk) = GetDlgItem(hwnd, IDC_SCROLLBAR_CHK) {
         let _ = windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow(chk, !pro);
     }
+    if let Ok(combo) = GetDlgItem(hwnd, IDC_PANEL_SIDE_COMBO) {
+        // El carrusel siempre aparece en el centro: la posición solo vale para la tira.
+        let _ = windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow(combo, !pro);
+    }
     if let Ok(label) = GetDlgItem(hwnd, IDC_PRO_PRIORITY_COMBO) {
         let _ = windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow(label, pro);
     }
+    // "Extender" ya usa una sola imagen para todos los monitores.
+    let span = GetDlgItem(hwnd, IDC_FIT_MODE_COMBO)
+        .map(|combo| FitMode::ALL.get(combo_selection(combo)) == Some(&FitMode::Span))
+        .unwrap_or(false);
+    if let Ok(chk) = GetDlgItem(hwnd, IDC_PER_MONITOR_CHK) {
+        let _ = windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow(chk, !span);
+    }
+    // La duración solo se usa con el lienzo.
+    let canvas = GetDlgItem(hwnd, IDC_APPLY_MODE_COMBO).map(|combo| combo_selection(combo) == 2).unwrap_or(false);
+    for id in [IDC_TRANSITION_EFFECT_COMBO, IDC_TRANSITION_COMBO] {
+        if let Ok(combo) = GetDlgItem(hwnd, id) {
+            let _ = windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow(combo, canvas);
+        }
+    }
+}
+
+/// Texto completo de un control.
+unsafe fn window_text(control: HWND) -> String {
+    let len = windows::Win32::UI::WindowsAndMessaging::GetWindowTextLengthW(control);
+    if len <= 0 { return String::new(); }
+    let mut buf = vec![0u16; (len + 1) as usize];
+    let read = windows::Win32::UI::WindowsAndMessaging::GetWindowTextW(control, &mut buf);
+    String::from_utf16_lossy(&buf[..read.max(0) as usize])
+}
+
+/// Aviso modal sobre la ventana de configuración.
+unsafe fn show_message(hwnd: HWND, text: &str) {
+    let _ = windows::Win32::UI::WindowsAndMessaging::MessageBoxW(
+        hwnd,
+        as_pcwstr(&to_wide_chars(text)),
+        as_pcwstr(&tr("SWEPR - Settings")),
+        windows::Win32::UI::WindowsAndMessaging::MB_ICONWARNING,
+    );
+}
+
+/// La ventana pasó a un monitor con otro DPI: nuevas fuentes y controles reescalados.
+unsafe fn rescale_for_dpi(hwnd: HWND, new_dpi: u32, suggested: &windows::Win32::Foundation::RECT) {
+    use windows::Win32::UI::WindowsAndMessaging::{GetClassNameW, GetWindow, GetWindowRect, MoveWindow, SetWindowPos, GW_CHILD, GW_HWNDNEXT, SWP_NOACTIVATE, SWP_NOZORDER, WM_SETFONT};
+    let new_dpi = new_dpi.max(96);
+    let old_dpi = CONFIG_DPI.lock().map(|mut dpi| std::mem::replace(&mut *dpi, new_dpi)).unwrap_or(96);
+    if old_dpi == new_dpi { return; }
+    log_info!("Configuración: DPI {old_dpi} -> {new_dpi}");
+    // Las fuentes viejas se borran cuando los controles ya usan las nuevas.
+    let mut old_fonts = Vec::new();
+    for (storage, title) in [(&CONFIG_FONT, false), (&CONFIG_TITLE_FONT, true)] {
+        if let Ok(mut font) = storage.lock() {
+            old_fonts.extend(font.take());
+            *font = Some(create_ui_font(new_dpi, title)).filter(|f| *f != 0);
+        }
+    }
+    let scale = |value: i32| (value as i64 * new_dpi as i64 / old_dpi as i64) as i32;
+    let font = ui_font();
+    let mut child = GetWindow(hwnd, GW_CHILD).unwrap_or_default();
+    while !child.is_invalid() {
+        let mut rect = windows::Win32::Foundation::RECT::default();
+        let _ = GetWindowRect(child, &mut rect);
+        let mut points = [
+            windows::Win32::Foundation::POINT { x: rect.left, y: rect.top },
+            windows::Win32::Foundation::POINT { x: rect.right, y: rect.bottom },
+        ];
+        windows::Win32::Graphics::Gdi::MapWindowPoints(None, hwnd, &mut points);
+        let mut class = [0u16; 32];
+        let len = GetClassNameW(child, &mut class).max(0) as usize;
+        let is_combo = String::from_utf16_lossy(&class[..len]).eq_ignore_ascii_case("ComboBox");
+        // La altura de un desplegable incluye su lista: se mantiene la de creación.
+        let height = if is_combo { px(200) } else { scale(points[1].y - points[0].y) };
+        let _ = MoveWindow(child, scale(points[0].x), scale(points[0].y), scale(points[1].x - points[0].x), height, false);
+        if font != 0 {
+            let _ = SendMessageW(child, WM_SETFONT, WPARAM(font as usize), LPARAM(0));
+        }
+        child = GetWindow(child, GW_HWNDNEXT).unwrap_or_default();
+    }
+    for old in old_fonts {
+        let _ = windows::Win32::Graphics::Gdi::DeleteObject(windows::Win32::Graphics::Gdi::HGDIOBJ(old as *mut _));
+    }
+    let _ = SetWindowPos(
+        hwnd, None, suggested.left, suggested.top, suggested.right - suggested.left, suggested.bottom - suggested.top,
+        SWP_NOZORDER | SWP_NOACTIVATE,
+    );
+    let _ = windows::Win32::Graphics::Gdi::InvalidateRect(hwnd, None, true);
 }
 
 unsafe extern "system" fn config_wnd_proc(
@@ -306,7 +435,11 @@ unsafe extern "system" fn config_wnd_proc(
             let _ = SetBkMode(dc, OPAQUE);
             LRESULT(brush(COLOR_FIELD_BG).0 as isize)
         }
-        _ if msg == windows::Win32::UI::WindowsAndMessaging::WM_USER + 100 => {
+        WM_APP_FOLDER_PICKED => {
+            BROWSE_OPEN.store(false, std::sync::atomic::Ordering::Release);
+            if let Ok(button) = GetDlgItem(hwnd, IDC_FOLDER_BTN) {
+                let _ = windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow(button, true);
+            }
             // Actualizar el edit con la ruta seleccionada (sin usar puntero colgante)
             if let Ok(mut g) = PENDING_FOLDER_PATH.lock() {
                 if let Some(s) = g.take() {
@@ -354,9 +487,25 @@ unsafe extern "system" fn config_wnd_proc(
                             let _ = SendMessageW(chk, BM_SETCHECK, WPARAM(check), LPARAM(0));
                         }
                     }
-                    if let Ok(chk) = GetDlgItem(hwnd, IDC_FADE_CHK) {
-                        let check = if config.wallpaper_fade { 1usize } else { 0usize };
-                        let _ = SendMessageW(chk, windows::Win32::UI::WindowsAndMessaging::BM_SETCHECK, WPARAM(check), LPARAM(0));
+                    if let Ok(combo) = GetDlgItem(hwnd, IDC_APPLY_MODE_COMBO) {
+                        let selection = match (config.apply_mode, config.wallpaper_fade) {
+                            (ApplyMode::Canvas, _) => 2,
+                            (ApplyMode::Windows, true) => 1,
+                            (ApplyMode::Windows, false) => 0,
+                        };
+                        let _ = SendMessageW(combo, windows::Win32::UI::WindowsAndMessaging::CB_SETCURSEL, WPARAM(selection), LPARAM(0));
+                    }
+                    if let Ok(combo) = GetDlgItem(hwnd, IDC_TRANSITION_EFFECT_COMBO) {
+                        let selection = Transition::ALL.iter().position(|t| *t == config.transition).unwrap_or(0);
+                        let _ = SendMessageW(combo, windows::Win32::UI::WindowsAndMessaging::CB_SETCURSEL, WPARAM(selection), LPARAM(0));
+                    }
+                    if let Ok(combo) = GetDlgItem(hwnd, IDC_TRANSITION_COMBO) {
+                        // La más parecida a la guardada (puede venir escrita a mano en el JSON).
+                        let selection = TRANSITION_MS.iter().enumerate()
+                            .min_by_key(|(_, ms)| ms.abs_diff(config.transition_ms))
+                            .map(|(index, _)| index)
+                            .unwrap_or(1);
+                        let _ = SendMessageW(combo, windows::Win32::UI::WindowsAndMessaging::CB_SETCURSEL, WPARAM(selection), LPARAM(0));
                     }
                     if let Ok(chk) = GetDlgItem(hwnd, IDC_AUTOSTART_CHK) {
                         if !chk.is_invalid() {
@@ -405,52 +554,74 @@ unsafe extern "system" fn config_wnd_proc(
                         let selected = THUMB_SIZES.iter().position(|size| *size == config.thumb_size_value()).map_or(usize::MAX, |index| index);
                         let _ = SendMessageW(combo, windows::Win32::UI::WindowsAndMessaging::CB_SETCURSEL, WPARAM(selected), LPARAM(0));
                     }
+                    let set_combo = |id: i32, index: Option<usize>| {
+                        if let Ok(combo) = GetDlgItem(hwnd, id) {
+                            let _ = SendMessageW(combo, windows::Win32::UI::WindowsAndMessaging::CB_SETCURSEL, WPARAM(index.unwrap_or(usize::MAX)), LPARAM(0));
+                        }
+                    };
+                    let set_check = |id: i32, checked: bool| {
+                        if let Ok(chk) = GetDlgItem(hwnd, id) {
+                            let _ = SendMessageW(chk, windows::Win32::UI::WindowsAndMessaging::BM_SETCHECK, WPARAM(checked as usize), LPARAM(0));
+                        }
+                    };
+                    set_combo(IDC_FIT_MODE_COMBO, FitMode::ALL.iter().position(|mode| *mode == config.fit_mode));
+                    set_combo(IDC_SORT_COMBO, Some(if config.sort_by == SortOrder::Date { 1 } else { 0 }));
+                    // Un intervalo escrito a mano que no esté en la lista deja el desplegable vacío y no se cambia.
+                    set_combo(IDC_ROTATION_COMBO, ROTATION_MINUTES.iter().position(|minutes| *minutes == config.rotation_minutes));
+                    set_check(IDC_SHUFFLE_CHK, config.shuffle);
+                    set_check(IDC_FAVORITES_ONLY_CHK, config.rotation_favorites_only);
+                    set_check(IDC_PER_MONITOR_CHK, config.per_monitor);
+                    update_mode_dependent_controls(hwnd);
                 }
             }
 
+            LRESULT(0)
+        }
+        WM_DPICHANGED => {
+            rescale_for_dpi(hwnd, (wparam.0 & 0xFFFF) as u32, &*(lparam.0 as *const windows::Win32::Foundation::RECT));
             LRESULT(0)
         }
         WM_COMMAND => {
             let cmd = (wparam.0 & 0xFFFF) as i32;
             match cmd {
                 IDC_FOLDER_BTN => {
+                    // Solo un diálogo a la vez: el botón queda desactivado hasta que se cierre.
+                    if BROWSE_OPEN.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                        return LRESULT(0);
+                    }
                     log_info!("Botón 'Examinar...' presionado");
-                    // Abrir IFileOpenDialog en un hilo STA separado
+                    if let Ok(button) = GetDlgItem(hwnd, IDC_FOLDER_BTN) {
+                        let _ = windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow(button, false);
+                    }
+                    // El hilo principal es MTA: el diálogo necesita un hilo STA propio.
                     let hwnd_val = hwnd.0 as isize;
                     std::thread::spawn(move || {
                         unsafe {
                             use windows::Win32::UI::Shell::{IFileOpenDialog, FOS_PICKFOLDERS, FOS_FORCEFILESYSTEM, FileOpenDialog, SIGDN_FILESYSPATH};
-                            use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED};
-                            
+                            use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED};
+
                             let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-                            
+                            let hwnd = HWND(hwnd_val as *mut _);
                             if let Ok(dialog) = CoCreateInstance::<_, IFileOpenDialog>(&FileOpenDialog, None, CLSCTX_INPROC_SERVER) {
                                 let options = dialog.GetOptions().unwrap_or_default();
                                 let _ = dialog.SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM);
                                 let dialog_title = tr("Select wallpaper folder");
                                 let _ = dialog.SetTitle(windows::core::PCWSTR(dialog_title.as_ptr()));
-                                
-                                let hwnd = windows::Win32::Foundation::HWND(hwnd_val as *mut _);
                                 if dialog.Show(hwnd).is_ok() {
                                     if let Ok(item) = dialog.GetResult() {
                                         if let Ok(path_ptr) = item.GetDisplayName(SIGDN_FILESYSPATH) {
                                             let path_str = path_ptr.to_string().unwrap_or_default();
+                                            CoTaskMemFree(Some(path_ptr.0 as *const _));
                                             log_info!("Carpeta seleccionada: {}", path_str);
-                                            
-                                            // Guardar la ruta en static y notificar al hilo principal (sin puntero colgante)
                                             if let Ok(mut g) = PENDING_FOLDER_PATH.lock() {
-                                                *g = Some(path_str.clone());
+                                                *g = Some(path_str);
                                             }
-                                            let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
-                                                hwnd,
-                                                windows::Win32::UI::WindowsAndMessaging::WM_USER + 100,
-                                                windows::Win32::Foundation::WPARAM(0),
-                                                windows::Win32::Foundation::LPARAM(0),
-                                            );
                                         }
                                     }
                                 }
                             }
+                            // Siempre avisar, aunque se cancele, para volver a activar el botón.
+                            let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(hwnd, WM_APP_FOLDER_PICKED, WPARAM(0), LPARAM(0));
                             CoUninitialize();
                         }
                     });
@@ -466,6 +637,14 @@ unsafe extern "system" fn config_wnd_proc(
                         );
                         return LRESULT(0);
                     };
+                    // La carpeta debe existir: si no, se avisa y no se guarda nada.
+                    let folder_text = GetDlgItem(hwnd, IDC_FOLDER_EDIT).map(|edit| window_text(edit)).unwrap_or_default();
+                    let folder_text = folder_text.trim().to_string();
+                    if !folder_text.is_empty() && !std::path::Path::new(&folder_text).is_dir() {
+                        show_message(hwnd, &crate::i18n::t("The wallpaper folder does not exist. Choose an existing folder."));
+                        return LRESULT(0);
+                    }
+                    let mut save_error = None;
                     if let Some(config_arc) = CONFIG_STATE.lock().ok().and_then(|g| g.clone()) {
                         if let Ok(mut config) = config_arc.lock() {
                             // Leer carpeta del edit
@@ -498,8 +677,23 @@ unsafe extern "system" fn config_wnd_proc(
                                     config.scan_subfolders = checked.0 == 1;
                                 }
                             }
-                            if let Ok(chk) = GetDlgItem(hwnd, IDC_FADE_CHK) {
-                                config.wallpaper_fade = SendMessageW(chk, windows::Win32::UI::WindowsAndMessaging::BM_GETCHECK, WPARAM(0), LPARAM(0)).0 == 1;
+                            if let Ok(combo) = GetDlgItem(hwnd, IDC_APPLY_MODE_COMBO) {
+                                match combo_selection(combo) {
+                                    0 => { config.apply_mode = ApplyMode::Windows; config.wallpaper_fade = false; }
+                                    1 => { config.apply_mode = ApplyMode::Windows; config.wallpaper_fade = true; }
+                                    2 => config.apply_mode = ApplyMode::Canvas,
+                                    _ => {}
+                                }
+                            }
+                            if let Ok(combo) = GetDlgItem(hwnd, IDC_TRANSITION_EFFECT_COMBO) {
+                                if let Some(transition) = Transition::ALL.get(combo_selection(combo)) {
+                                    config.transition = *transition;
+                                }
+                            }
+                            if let Ok(combo) = GetDlgItem(hwnd, IDC_TRANSITION_COMBO) {
+                                if let Some(ms) = TRANSITION_MS.get(combo_selection(combo)) {
+                                    config.transition_ms = *ms;
+                                }
                             }
                             if let Ok(chk) = GetDlgItem(hwnd, IDC_AUTOSTART_CHK) {
                                 if !chk.is_invalid() {
@@ -548,13 +742,39 @@ unsafe extern "system" fn config_wnd_proc(
                             }
                             crate::i18n::set_language(config.language.clone());
                             config.hotkeys = hotkeys;
+                            if let Ok(combo) = GetDlgItem(hwnd, IDC_FIT_MODE_COMBO) {
+                                if let Some(mode) = FitMode::ALL.get(combo_selection(combo)) {
+                                    config.fit_mode = *mode;
+                                }
+                            }
+                            if let Ok(combo) = GetDlgItem(hwnd, IDC_SORT_COMBO) {
+                                config.sort_by = if combo_selection(combo) == 1 { SortOrder::Date } else { SortOrder::Name };
+                            }
+                            if let Ok(combo) = GetDlgItem(hwnd, IDC_ROTATION_COMBO) {
+                                if let Some(minutes) = ROTATION_MINUTES.get(combo_selection(combo)) {
+                                    config.rotation_minutes = *minutes;
+                                }
+                            }
+                            let checked = |id: i32| GetDlgItem(hwnd, id)
+                                .map(|chk| SendMessageW(chk, windows::Win32::UI::WindowsAndMessaging::BM_GETCHECK, WPARAM(0), LPARAM(0)).0 == 1)
+                                .unwrap_or(false);
+                            config.shuffle = checked(IDC_SHUFFLE_CHK);
+                            config.rotation_favorites_only = checked(IDC_FAVORITES_ONLY_CHK);
+                            config.per_monitor = checked(IDC_PER_MONITOR_CHK);
                             let autostart_enabled = config.autostart;
-                            let _ = config.save();
+                            if let Err(e) = config.save() {
+                                crate::log_error!("No se pudo guardar la configuración: {e}");
+                                save_error = Some(e);
+                            }
                             if let Err(e) = crate::config::autostart::set_autostart(autostart_enabled) {
                                 crate::log_warn!("No se pudo sincronizar autoarranque: {e}");
                             }
                             log_info!("Configuración guardada");
                         }
+                    }
+                    if let Some(e) = save_error {
+                        // Los cambios ya están en memoria y se aplican, pero se perderán al reiniciar.
+                        show_message(hwnd, &format!("{}\n\n{e}", crate::i18n::t("Settings could not be saved to disk. They will apply until SWEPR is closed.")));
                     }
                     // Notificar al main window que la config cambió
                     if let Some(main_hwnd) = crate::app::MAIN_HWND.lock().ok().and_then(|g| *g) {
@@ -569,7 +789,12 @@ unsafe extern "system" fn config_wnd_proc(
                     }
                     let _ = DestroyWindow(hwnd);
                 }
-                IDC_PANEL_MODE_COMBO => {
+                IDC_HIDDEN_BTN => {
+                    if let Some(config) = CONFIG_STATE.lock().ok().and_then(|g| g.clone()) {
+                        super::hidden::show(hwnd, config);
+                    }
+                }
+                IDC_PANEL_MODE_COMBO | IDC_FIT_MODE_COMBO | IDC_APPLY_MODE_COMBO => {
                     // CBN_SELCHANGE
                     if (wparam.0 >> 16) & 0xFFFF == 1 {
                         update_mode_dependent_controls(hwnd);

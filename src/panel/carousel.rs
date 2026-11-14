@@ -266,6 +266,22 @@ pub fn clear_tiles() {
     }
 }
 
+/// Libera las tarjetas de estos archivos (por ejemplo, porque se editaron) para que se regeneren.
+pub fn forget(keys: &HashSet<String>) {
+    if let Ok(mut guard) = TILES.lock() {
+        if let Some(cache) = guard.as_mut() {
+            cache.tiles.retain(|key, (thumb, _)| {
+                let keep = !keys.contains(key);
+                if !keep { delete_bitmap(thumb); }
+                keep
+            });
+        }
+    }
+    if let Ok(mut pending) = PENDING.lock() {
+        if let Some(set) = pending.as_mut() { set.retain(|key| !keys.contains(key)); }
+    }
+}
+
 /// Pide las tarjetas que faltan y olvida las peticiones que ya no hacen falta.
 fn request_missing(images: &[ScannedImage], wanted: Vec<usize>, layout: &Layout, notify: HWND) {
     let wanted_keys: Vec<(String, &Path)> = wanted.into_iter().filter_map(|index| images.get(index))
@@ -319,16 +335,20 @@ pub struct PaintInput<'a> {
     pub current: Option<&'a Path>,
     pub scales: &'a [f32],
     pub notify: HWND,
+    /// Botón de la tarjeta enfocada que está bajo el ratón.
+    pub hot_button: Option<super::ItemButton>,
 }
 
-pub unsafe fn paint(dc: HDC, width: i32, height: i32, input: &PaintInput) {
+/// Pinta el carrusel. Devuelve los botones de la tarjeta enfocada, si se dibujaron.
+pub unsafe fn paint(dc: HDC, width: i32, height: i32, input: &PaintInput) -> Option<super::ItemButtons> {
     let key_brush = CreateSolidBrush(COLOR_KEY);
     let _ = FillRect(dc, &RECT { left: 0, top: 0, right: width, bottom: height }, key_brush);
     let _ = DeleteObject(key_brush);
 
-    let Some(layout) = layout() else { return; };
+    let layout = layout()?;
     let count = input.images.len();
-    if count == 0 { return; }
+    if count == 0 { return None; }
+    let mut buttons = None;
     let visible = layout.loop_visible_range(width, input.scroll);
     let virtuals: Vec<i64> = visible.clone().collect();
     let real_indices: HashSet<usize> = virtuals.iter().map(|i| i.rem_euclid(count as i64) as usize).collect();
@@ -415,7 +435,7 @@ pub unsafe fn paint(dc: HDC, width: i32, height: i32, input: &PaintInput) {
         }
         let _ = SelectClipRgn(dc, HRGN(std::ptr::null_mut()));
 
-        let is_current = input.current.is_some_and(|p| p == img.path);
+        let is_current = input.current.is_some_and(|p| crate::winutil::same_path(p, &img.path));
         let frame = if input.focus == Some(index) && focus_amount > 0.5 {
             Some(super::COLOR_FOCUS)
         } else if is_current {
@@ -429,8 +449,15 @@ pub unsafe fn paint(dc: HDC, width: i32, height: i32, input: &PaintInput) {
             let _ = DeleteObject(brush);
         }
         let _ = DeleteObject(region);
-        if img.is_new {
-            super::draw_new_badge(dc, points[1].x, rect.top);
+        if input.focus == Some(index) && focus_amount > 0.5 {
+            buttons = Some(super::draw_item_buttons(dc, index, points[1].x, rect.top, img.is_favorite, input.hot_button));
+        } else {
+            if img.is_new {
+                super::draw_new_badge(dc, points[1].x, rect.top);
+            }
+            if img.is_favorite {
+                super::draw_favorite_badge(dc, points[0].x, rect.top);
+            }
         }
     }
 
@@ -439,6 +466,7 @@ pub unsafe fn paint(dc: HDC, width: i32, height: i32, input: &PaintInput) {
     let _ = DeleteObject(shade_bmp);
     let _ = DeleteDC(shade_dc);
     let _ = DeleteDC(src_dc);
+    buttons
 }
 
 #[cfg(test)]
@@ -502,6 +530,8 @@ mod tests {
             path: p.clone(),
             file_name: String::new(),
             is_new: i == 1,
+            is_favorite: i == 3,
+            modified: None,
         }).collect();
         let layout = Layout::for_monitor(1080);
         set_layout(layout);
@@ -532,6 +562,7 @@ mod tests {
                 current: images.get(2).map(|i| i.path.as_path()),
                 scales: &scales,
                 notify: HWND::default(),
+                hot_button: None,
             });
             SelectObject(dc, old);
 

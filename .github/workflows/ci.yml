@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # rc.exe (Windows SDK) es necesario para incrustar el icono y la versión.
+      - uses: ilammy/msvc-dev-cmd@v1
+      - name: Build
+        run: cargo build --locked
+      - name: Test
+        run: cargo test --locked
+      - name: Clippy
+        run: cargo clippy --locked --all-targets
+      - name: Installer script compiles
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress }
+          & $iscc /Qp /DAppVersion=0.0.0-ci "/DSourceExe=$PWD\target\debug\swepr.exe" "/DOutputDir=$PWD\target\installer" installer\swepr.iss
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed" }
+      - name: Translation keys match
+        shell: pwsh
+        run: |
+          $en = (Get-Content languages/en.json -Raw | ConvertFrom-Json).PSObject.Properties.Name | Sort-Object
+          $es = (Get-Content languages/es.json -Raw | ConvertFrom-Json).PSObject.Properties.Name | Sort-Object
+          $diff = Compare-Object $en $es
+          if ($diff) { $diff | Format-Table | Out-String | Write-Host; throw "en.json and es.json have different keys" }

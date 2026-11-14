@@ -5,16 +5,18 @@ use crate::config::{PanelMode, PanelSide, ProPriority};
 use crate::log_info;
 use crate::scanner::ScannedImage;
 use crate::thumbs::ThumbnailCache;
-use crate::winutil::{as_pcwstr, to_wide_chars};
+use crate::winutil::{as_pcwstr, same_path, to_wide_chars};
+use std::cell::{Cell, RefCell};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateRoundRectRgn, CreateSolidBrush, DeleteDC, DeleteObject, EndPaint, FillRect, FrameRgn, GetMonitorInfoW, MonitorFromPoint, SelectClipRgn, SelectObject, SetStretchBltMode, StretchBlt, COLORONCOLOR, MONITOR_DEFAULTTONEAREST, MONITORINFO, SRCCOPY,
+    BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateRoundRectRgn, CreateSolidBrush, DeleteDC, DeleteObject, EndPaint, FillRect, FrameRgn, GetMonitorInfoW, MonitorFromPoint, SelectClipRgn, SelectObject, SetStretchBltMode, StretchBlt, COLORONCOLOR, HDC, MONITOR_DEFAULTTONEAREST, MONITORINFO, SRCCOPY,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, GetCursorPos, GetWindowRect, KillTimer, LoadCursorW, RegisterClassW, SetCursor, SetTimer, SetWindowPos, ShowWindow,
-    CS_HREDRAW, CS_VREDRAW, HWND_TOPMOST, IDC_ARROW, SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOW, WM_CREATE, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCHITTEST, WM_PAINT, WM_SETCURSOR, WM_TIMER, WNDCLASSW,
+    CS_HREDRAW, CS_VREDRAW, HWND_TOPMOST, IDC_ARROW, SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOW, WM_CREATE, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCHITTEST, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WM_TIMER, WNDCLASSW,
     WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
@@ -45,23 +47,12 @@ const COLOR_FOCUS: COLORREF = COLORREF(0x00FFFFFF);
 const COLOR_CURRENT: COLORREF = COLORREF(0x00FFC24C);
 /// Punto de las imágenes recién descubiertas (verde).
 const COLOR_NEW: COLORREF = COLORREF(0x005FCB6C);
+/// Estrella de las favoritas (dorado).
+const COLOR_FAVORITE: COLORREF = COLORREF(0x0030C8FF);
 const BASE_NEW_BADGE: i32 = 10;
 
-/// Carga de miniaturas bajo demanda (si no, se generan todas al escanear).
-static PANEL_THUMBS_ON_DEMAND: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-static PANEL_THUMB_SIZE_PX: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(128);
 /// Máximo de miniaturas pequeñas en memoria en modo bajo demanda.
 const ON_DEMAND_CAPACITY: usize = 200;
-
-static PANEL_DPI: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(96);
-
-fn px(value: i32) -> i32 {
-    value * PANEL_DPI.load(std::sync::atomic::Ordering::Relaxed) as i32 / 96
-}
-fn thumb_w() -> i32 { px(BASE_THUMB_W) }
-fn thumb_h() -> i32 { px(BASE_THUMB_H) }
-fn thumb_margin() -> i32 { px(BASE_THUMB_MARGIN) }
-fn scrollbar_size() -> i32 { px(BASE_SCROLLBAR).max(1) }
 
 const HOVER_ANIM_TIMER_ID: usize = 8003;
 const HOVER_ANIM_STEP_MS: u32 = 16;
@@ -71,57 +62,180 @@ const TILE_RELEASE_DELAY_MS: u32 = 30_000;
 /// Desplazamiento vertical de la animación de entrada/salida del carrusel.
 const CAROUSEL_SLIDE_PX: i32 = 24;
 
+// Menú contextual de una miniatura.
+const IDM_APPLY: usize = 1;
+const IDM_APPLY_MONITOR: usize = 2;
+const IDM_LOCK_SCREEN: usize = 3;
+const IDM_FAVORITE: usize = 4;
+const IDM_REVEAL: usize = 5;
+const IDM_EXCLUDE: usize = 6;
 
-#[derive(Clone)]
-struct PanelState {
-    target_x: i32,
-    start_x: i32,
-    current_x: i32,
-    target_y: i32,
-    start_y: i32,
-    current_y: i32,
-    anim_start_time: std::time::Instant,
-    animating: bool,
+/// Botones que aparecen sobre la miniatura o tarjeta con el foco.
+const BASE_BUTTON: i32 = 24;
+const BASE_BUTTON_GAP: i32 = 6;
+const COLOR_BUTTON_BG: COLORREF = COLORREF(0x00202020);
+const COLOR_BUTTON_HOT: COLORREF = COLORREF(0x00484848);
+const COLOR_BUTTON_BORDER: COLORREF = COLORREF(0x00707070);
+const COLOR_BUTTON_GLYPH: COLORREF = COLORREF(0x00E8E8E8);
+
+/// Botón sobre una imagen.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ItemButton {
+    Favorite,
+    Exclude,
 }
 
+/// Botones dibujados en el último fotograma: imagen y rectángulos (favorita, quitar).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ItemButtons {
+    pub index: usize,
+    pub favorite: RECT,
+    pub exclude: RECT,
+}
 
+impl ItemButtons {
+    fn at(&self, x: i32, y: i32) -> Option<ItemButton> {
+        let inside = |r: &RECT| x >= r.left && x < r.right && y >= r.top && y < r.bottom;
+        if inside(&self.favorite) {
+            Some(ItemButton::Favorite)
+        } else if inside(&self.exclude) {
+            Some(ItemButton::Exclude)
+        } else {
+            None
+        }
+    }
+}
 
-static PANEL_STATE: Mutex<Option<PanelState>> = Mutex::new(None);
-static PANEL_HWND: Mutex<Option<isize>> = Mutex::new(None);
-static PANEL_VISIBLE: Mutex<bool> = Mutex::new(false);
-static PANEL_EXITING: Mutex<bool> = Mutex::new(false);
-static PANEL_CLOSE_ON_MOUSE_LEAVE: Mutex<bool> = Mutex::new(true);
-static PANEL_SIDE: Mutex<PanelSide> = Mutex::new(PanelSide::Top);
-static PANEL_MODE: Mutex<PanelMode> = Mutex::new(PanelMode::LowPower);
-static PANEL_SHOW_SCROLLBAR: Mutex<bool> = Mutex::new(true);
-static PANEL_MARGIN: Mutex<u32> = Mutex::new(0);
-static PANEL_WIDTH: Mutex<i32> = Mutex::new(800);
-static PANEL_HEIGHT: Mutex<i32> = Mutex::new(150);
+/// Animación de entrada o salida del panel.
+#[derive(Clone, Copy)]
+struct Slide {
+    target_x: i32,
+    start_x: i32,
+    target_y: i32,
+    start_y: i32,
+    anim_start_time: std::time::Instant,
+}
 
-static PANEL_THUMB_CACHE: Mutex<Option<ThumbnailCache>> = Mutex::new(None);
-static PANEL_SCANNED: Mutex<Option<Arc<Mutex<Vec<ScannedImage>>>>> = Mutex::new(None);
-static PANEL_SCROLL_OFFSET: Mutex<i32> = Mutex::new(0);
-static PANEL_HOVER_INDEX: Mutex<Option<usize>> = Mutex::new(None);
-static PANEL_SELECTED_INDEX: Mutex<Option<usize>> = Mutex::new(None);
-static PANEL_DRAGGING: Mutex<bool> = Mutex::new(false);
-static PANEL_LAST_MOUSE_X: Mutex<i32> = Mutex::new(0);
-static PANEL_DRAG_START_X: Mutex<i32> = Mutex::new(0);
-static PANEL_DRAG_START_Y: Mutex<i32> = Mutex::new(0);
-static PANEL_THUMB_SCALES: Mutex<Vec<f32>> = Mutex::new(Vec::new());
-static PANEL_THUMB_TARGETS: Mutex<Vec<f32>> = Mutex::new(Vec::new());
-static PANEL_THUMB_ANIM: Mutex<bool> = Mutex::new(false);
-static PANEL_CURRENT_WALLPAPER: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
-/// Scroll hacia el que se anima el carrusel al cambiar la selección.
-static PANEL_SCROLL_TARGET: Mutex<Option<i32>> = Mutex::new(None);
-/// Posición virtual sin límite; el índice visible sigue siendo este valor módulo la cantidad.
-static PANEL_CAROUSEL_INDEX: Mutex<i64> = Mutex::new(0);
+/// Lienzo fuera de pantalla: se crea al pintar la primera vez y se reutiliza en cada fotograma
+/// hasta que el panel se oculta.
+#[derive(Clone, Copy)]
+struct Backbuffer {
+    dc: HDC,
+    bitmap: windows::Win32::Graphics::Gdi::HBITMAP,
+    old: windows::Win32::Graphics::Gdi::HGDIOBJ,
+    width: i32,
+    height: i32,
+}
+
+/// Todo el estado del panel. Solo lo usa el hilo de interfaz (el panel, la ventana principal y
+/// la de configuración comparten hilo), así que vive en un `thread_local` con `Cell`/`RefCell`:
+/// sin mutex, sin envenenamiento y sin riesgo de bloqueo al reentrar en el procedimiento de ventana.
+struct PanelVars {
+    slide: Cell<Option<Slide>>,
+    hwnd: Cell<Option<HWND>>,
+    visible: Cell<bool>,
+    exiting: Cell<bool>,
+    close_on_mouse_leave: Cell<bool>,
+    /// Hay un menú contextual abierto: el panel no debe cerrarse solo.
+    menu_open: Cell<bool>,
+    side: Cell<PanelSide>,
+    mode: Cell<PanelMode>,
+    show_scrollbar: Cell<bool>,
+    margin: Cell<u32>,
+    width: Cell<i32>,
+    height: Cell<i32>,
+    dpi: Cell<u32>,
+    thumbs_on_demand: Cell<bool>,
+    thumb_size_px: Cell<i32>,
+    thumb_cache: RefCell<Option<ThumbnailCache>>,
+    scanned: RefCell<Option<Arc<Mutex<Vec<ScannedImage>>>>>,
+    scroll: Cell<i32>,
+    /// Scroll hacia el que se anima el carrusel al cambiar la selección.
+    scroll_target: Cell<Option<i32>>,
+    hover: Cell<Option<usize>>,
+    selected: Cell<Option<usize>>,
+    dragging: Cell<bool>,
+    last_mouse: Cell<i32>,
+    drag_start: Cell<(i32, i32)>,
+    scales: RefCell<Vec<f32>>,
+    targets: RefCell<Vec<f32>>,
+    current_wallpaper: RefCell<Option<PathBuf>>,
+    /// Posición virtual sin límite; el índice visible sigue siendo este valor módulo la cantidad.
+    carousel_index: Cell<i64>,
+    backbuffer: Cell<Option<Backbuffer>>,
+    /// Hay animación de escala o desplazamiento en curso.
+    animating: Cell<bool>,
+    /// Momento del último paso de animación (los pasos dependen del tiempo, no de los ticks).
+    anim_last: Cell<Option<std::time::Instant>>,
+    /// Botones de la imagen con el foco, tal como se pintaron.
+    buttons: Cell<Option<ItemButtons>>,
+    /// Botón bajo el ratón.
+    hot_button: Cell<Option<ItemButton>>,
+}
+
+impl Default for PanelVars {
+    fn default() -> Self {
+        Self {
+            slide: Cell::new(None),
+            hwnd: Cell::new(None),
+            visible: Cell::new(false),
+            exiting: Cell::new(false),
+            close_on_mouse_leave: Cell::new(true),
+            menu_open: Cell::new(false),
+            side: Cell::new(PanelSide::Top),
+            mode: Cell::new(PanelMode::LowPower),
+            show_scrollbar: Cell::new(true),
+            margin: Cell::new(0),
+            width: Cell::new(800),
+            height: Cell::new(150),
+            dpi: Cell::new(96),
+            thumbs_on_demand: Cell::new(false),
+            thumb_size_px: Cell::new(128),
+            thumb_cache: RefCell::new(None),
+            scanned: RefCell::new(None),
+            scroll: Cell::new(0),
+            scroll_target: Cell::new(None),
+            hover: Cell::new(None),
+            selected: Cell::new(None),
+            dragging: Cell::new(false),
+            last_mouse: Cell::new(0),
+            drag_start: Cell::new((0, 0)),
+            scales: RefCell::new(Vec::new()),
+            targets: RefCell::new(Vec::new()),
+            current_wallpaper: RefCell::new(None),
+            carousel_index: Cell::new(0),
+            backbuffer: Cell::new(None),
+            animating: Cell::new(false),
+            anim_last: Cell::new(None),
+            buttons: Cell::new(None),
+            hot_button: Cell::new(None),
+        }
+    }
+}
+
+thread_local! {
+    static VARS: PanelVars = PanelVars::default();
+}
+
+/// Acceso al estado del panel.
+fn vars<R>(f: impl FnOnce(&PanelVars) -> R) -> R {
+    VARS.with(f)
+}
+
+fn px(value: i32) -> i32 {
+    value * vars(|v| v.dpi.get()) as i32 / 96
+}
+fn thumb_w() -> i32 { px(BASE_THUMB_W) }
+fn thumb_h() -> i32 { px(BASE_THUMB_H) }
+fn thumb_margin() -> i32 { px(BASE_THUMB_MARGIN) }
+fn scrollbar_size() -> i32 { px(BASE_SCROLLBAR).max(1) }
 
 fn is_carousel() -> bool {
-    PANEL_MODE.lock().map(|mode| *mode == PanelMode::Pro).unwrap_or(false)
+    vars(|v| v.mode.get() == PanelMode::Pro)
 }
 
 fn is_vertical() -> bool {
-    !is_carousel() && PANEL_SIDE.lock().map(|side| matches!(*side, PanelSide::Left | PanelSide::Right)).unwrap_or(false)
+    !is_carousel() && matches!(vars(|v| v.side.get()), PanelSide::Left | PanelSide::Right)
 }
 
 /// Escala de la miniatura con foco: el carrusel la agranda, las tiras la encogen.
@@ -129,16 +243,21 @@ fn focus_scale() -> f32 {
     if is_carousel() { carousel::FOCUS_SCALE } else { 0.9 }
 }
 
+fn scanned() -> Option<Arc<Mutex<Vec<ScannedImage>>>> {
+    vars(|v| v.scanned.borrow().clone())
+}
+
 fn image_count() -> usize {
-    PANEL_SCANNED.lock().ok().and_then(|g| g.clone()).and_then(|arc| arc.lock().ok().map(|v| v.len())).unwrap_or(0)
+    scanned().and_then(|arc| arc.lock().ok().map(|images| images.len())).unwrap_or(0)
+}
+
+/// Ruta de la imagen en `index`.
+fn image_path(index: usize) -> Option<PathBuf> {
+    scanned().and_then(|arc| arc.lock().ok().and_then(|images| images.get(index).map(|img| img.path.clone())))
 }
 
 fn viewport() -> i32 {
-    if is_vertical() {
-        PANEL_HEIGHT.lock().map(|g| *g).unwrap_or(600)
-    } else {
-        PANEL_WIDTH.lock().map(|g| *g).unwrap_or(800)
-    }
+    if is_vertical() { vars(|v| v.height.get()) } else { vars(|v| v.width.get()) }
 }
 
 fn max_scroll(count: usize) -> i32 {
@@ -151,7 +270,7 @@ fn max_scroll(count: usize) -> i32 {
 /// Índice de la miniatura bajo un punto en coordenadas de cliente.
 fn thumbnail_at(x: i32, y: i32) -> Option<usize> {
     let count = image_count();
-    let scroll = PANEL_SCROLL_OFFSET.lock().map(|g| *g).unwrap_or(0);
+    let scroll = vars(|v| v.scroll.get());
     if let Some(layout) = carousel::layout().filter(|_| is_carousel()) {
         return layout.loop_hit_test(x, y, count, scroll)
             .map(|virtual_index| virtual_index.rem_euclid(count.max(1) as i64) as usize);
@@ -172,19 +291,18 @@ fn wrapped_step(sel: usize, count: usize, forward: bool) -> usize {
 fn step_selection(hwnd: HWND, forward: bool) {
     let count = image_count();
     if count == 0 { return; }
-    let sel = PANEL_SELECTED_INDEX.lock().ok().and_then(|g| *g).unwrap_or(0).min(count - 1);
+    let sel = vars(|v| v.selected.get()).unwrap_or(0).min(count - 1);
     if let Some(layout) = carousel::layout().filter(|_| is_carousel()) {
-        let virtual_index = if let Ok(mut index) = PANEL_CAROUSEL_INDEX.lock() {
-            *index += if forward { 1 } else { -1 };
-            *index
-        } else { sel as i64 + if forward { 1 } else { -1 } };
+        let virtual_index = vars(|v| {
+            let index = v.carousel_index.get() + if forward { 1 } else { -1 };
+            v.carousel_index.set(index);
+            index
+        });
         let next = virtual_index.rem_euclid(count as i64) as usize;
-        if let Ok(mut selected) = PANEL_SELECTED_INDEX.lock() { *selected = Some(next); }
+        vars(|v| v.selected.set(Some(next)));
         set_hover_target(hwnd, Some(next));
-        if let Ok(mut target) = PANEL_SCROLL_TARGET.lock() {
-            *target = Some(layout.loop_center_scroll(virtual_index, viewport()));
-        }
-        unsafe { let _ = SetTimer(hwnd, HOVER_ANIM_TIMER_ID, HOVER_ANIM_STEP_MS, None); }
+        vars(|v| v.scroll_target.set(Some(layout.loop_center_scroll(virtual_index, viewport()))));
+        start_animation(hwnd);
         return;
     }
     select_index(hwnd, wrapped_step(sel, count, forward));
@@ -192,23 +310,26 @@ fn step_selection(hwnd: HWND, forward: bool) {
 
 /// Selecciona una miniatura y desplaza la vista para que se vea (centrada en el carrusel).
 fn select_index(hwnd: HWND, sel: usize) {
-    if let Ok(mut g) = PANEL_SELECTED_INDEX.lock() { *g = Some(sel); }
+    vars(|v| v.selected.set(Some(sel)));
     set_hover_target(hwnd, Some(sel));
     let count = image_count();
     if let Some(layout) = carousel::layout().filter(|_| is_carousel()) {
-        let current = PANEL_CAROUSEL_INDEX.lock().map(|g| *g).unwrap_or(sel as i64);
+        let current = vars(|v| v.carousel_index.get());
+        let scroll = vars(|v| v.scroll.get());
         let base = current.div_euclid(count.max(1) as i64) * count as i64 + sel as i64;
         let virtual_index = [base - count as i64, base, base + count as i64]
-            .into_iter().min_by_key(|i| (layout.loop_center_scroll(*i, viewport()) - PANEL_SCROLL_OFFSET.lock().map(|g| *g).unwrap_or(0)).abs())
+            .into_iter().min_by_key(|i| (layout.loop_center_scroll(*i, viewport()) - scroll).abs())
             .unwrap_or(base);
-        if let Ok(mut index) = PANEL_CAROUSEL_INDEX.lock() { *index = virtual_index; }
-        if let Ok(mut target) = PANEL_SCROLL_TARGET.lock() { *target = Some(layout.loop_center_scroll(virtual_index, viewport())); }
-        unsafe { let _ = SetTimer(hwnd, HOVER_ANIM_TIMER_ID, HOVER_ANIM_STEP_MS, None); }
+        vars(|v| {
+            v.carousel_index.set(virtual_index);
+            v.scroll_target.set(Some(layout.loop_center_scroll(virtual_index, viewport())));
+        });
+        start_animation(hwnd);
         return;
     }
     let vertical = is_vertical();
     let viewport = viewport();
-    let scroll = PANEL_SCROLL_OFFSET.lock().map(|g| *g).unwrap_or(0);
+    let scroll = vars(|v| v.scroll.get());
     let item_extent = if vertical { thumb_h() + thumb_margin() } else { thumb_w() + thumb_margin() };
     let item_size = if vertical { thumb_h() } else { thumb_w() };
     let item_x = sel as i32 * item_extent + thumb_margin();
@@ -216,7 +337,7 @@ fn select_index(hwnd: HWND, sel: usize) {
     if item_x < scroll { new_scroll = item_x.saturating_sub(thumb_margin()); }
     let right_edge = item_x + item_size;
     if right_edge > scroll + viewport { new_scroll = right_edge - viewport + thumb_margin(); }
-    if let Ok(mut g) = PANEL_SCROLL_OFFSET.lock() { *g = new_scroll.max(0); }
+    vars(|v| v.scroll.set(new_scroll.max(0)));
     request_repaint();
 }
 
@@ -230,7 +351,7 @@ unsafe fn set_panel_alpha(hwnd: HWND, alpha: u8) {
 }
 
 /// Punto verde en la esquina superior derecha de una miniatura nueva.
-unsafe fn draw_new_badge(dc: windows::Win32::Graphics::Gdi::HDC, right: i32, top: i32) {
+unsafe fn draw_new_badge(dc: HDC, right: i32, top: i32) {
     use windows::Win32::Graphics::Gdi::{CreateEllipticRgn, FillRgn};
     let size = px(BASE_NEW_BADGE);
     let inset = px(6);
@@ -241,8 +362,26 @@ unsafe fn draw_new_badge(dc: windows::Win32::Graphics::Gdi::HDC, right: i32, top
     let _ = DeleteObject(rgn);
 }
 
+/// Estrella dorada en la esquina superior izquierda de una favorita.
+unsafe fn draw_favorite_badge(dc: HDC, left: i32, top: i32) {
+    use windows::Win32::Graphics::Gdi::{CreatePolygonRgn, FillRgn, WINDING};
+    let radius = px(BASE_NEW_BADGE) as f32 * 0.75;
+    let inset = px(6) as f32;
+    let (cx, cy) = (left as f32 + inset + radius, top as f32 + inset + radius);
+    let points: Vec<POINT> = (0..10).map(|i| {
+        let r = if i % 2 == 0 { radius } else { radius * 0.45 };
+        let angle = -std::f32::consts::FRAC_PI_2 + i as f32 * std::f32::consts::PI / 5.0;
+        POINT { x: (cx + r * angle.cos()).round() as i32, y: (cy + r * angle.sin()).round() as i32 }
+    }).collect();
+    let rgn = CreatePolygonRgn(&points, WINDING);
+    let brush = CreateSolidBrush(COLOR_FAVORITE);
+    let _ = FillRgn(dc, rgn, brush);
+    let _ = DeleteObject(brush);
+    let _ = DeleteObject(rgn);
+}
+
 /// Aviso centrado cuando la carpeta no tiene imágenes.
-unsafe fn draw_empty_state(dc: windows::Win32::Graphics::Gdi::HDC, width: i32, height: i32) {
+unsafe fn draw_empty_state(dc: HDC, width: i32, height: i32) {
     use windows::Win32::Graphics::Gdi::{CreateFontW, DrawTextW, SetBkMode, SetTextColor, DT_CENTER, DT_SINGLELINE, DT_VCENTER, DT_WORDBREAK, FW_NORMAL, TRANSPARENT};
     let box_w = px(420).min(width);
     let box_h = px(64).min(height);
@@ -295,69 +434,154 @@ fn thumbnail_origin(index: usize, count: usize, viewport: i32, scroll: i32, vert
     if vertical { (thumb_margin(), origin) } else { (origin, thumb_margin()) }
 }
 
-/// Actualiza el objetivo de animación hover/foco para las miniaturas e inicia el temporizador de interpolación.
-fn set_hover_target(hwnd: HWND, new_hover: Option<usize>) {
-    let prev_hover = if let Ok(g) = PANEL_HOVER_INDEX.lock() { *g } else { None };
-    if prev_hover == new_hover {
-        return;
-    }
-    if let Ok(mut g) = PANEL_HOVER_INDEX.lock() { *g = new_hover; }
+/// Pone en marcha la animación de escala/desplazamiento (si no lo estaba ya).
+fn start_animation(hwnd: HWND) {
+    if vars(|v| v.animating.replace(true)) { return; }
+    vars(|v| v.anim_last.set(Some(std::time::Instant::now())));
+    unsafe { let _ = SetTimer(hwnd, HOVER_ANIM_TIMER_ID, HOVER_ANIM_STEP_MS, None); }
+}
 
-    let n = if let Ok(g) = PANEL_SCANNED.lock() {
-        if let Some(arc) = g.clone() {
-            if let Ok(v) = arc.lock() { v.len() } else { 0 }
-        } else { 0 }
-    } else { 0 };
-
-    if n > 0 {
-        if let Ok(mut s) = PANEL_THUMB_SCALES.lock() {
-            s.resize(n, 1.0);
+/// Avanza la animación según el tiempo transcurrido desde el paso anterior. Así va a la misma
+/// velocidad aunque los ticks del temporizador se retrasen (por ejemplo, con el ratón moviéndose
+/// rápido, Windows prioriza los mensajes del ratón y los WM_TIMER llegan tarde o no llegan).
+fn advance_animation(hwnd: HWND) {
+    if !vars(|v| v.animating.get()) { return; }
+    let now = std::time::Instant::now();
+    let elapsed = vars(|v| v.anim_last.replace(Some(now)))
+        .map(|last| now.duration_since(last).as_secs_f32())
+        .unwrap_or(1.0 / 60.0)
+        .min(0.1);
+    // Cada 1/60 s se recorre un 25 % de lo que falta (el mismo ritmo que antes a 60 fps).
+    let factor = 1.0 - 0.75f32.powf(elapsed * 60.0);
+    let mut done = true;
+    if let Some(goal) = vars(|v| v.scroll_target.get()) {
+        let scroll = vars(|v| v.scroll.get());
+        let diff = goal - scroll;
+        if diff.abs() <= 1 {
+            vars(|v| {
+                v.scroll.set(goal);
+                v.scroll_target.set(None);
+            });
+        } else {
+            let step = (diff as f32 * factor) as i32;
+            vars(|v| v.scroll.set(scroll + if step == 0 { diff.signum() } else { step }));
+            done = false;
         }
-        if let Ok(mut t) = PANEL_THUMB_TARGETS.lock() {
-            t.resize(n, 1.0);
-            for v in t.iter_mut() { *v = 1.0; }
-            if let Some(idx) = new_hover {
-                if idx < t.len() { t[idx] = focus_scale(); }
+    }
+    vars(|v| {
+        let mut scales = v.scales.borrow_mut();
+        let targets = v.targets.borrow();
+        for (scale, target) in scales.iter_mut().zip(targets.iter()) {
+            let diff = target - *scale;
+            if diff.abs() > 0.002 {
+                *scale += diff * factor;
+                done = false;
+            } else {
+                *scale = *target;
             }
         }
-        if let Ok(mut anim) = PANEL_THUMB_ANIM.lock() { *anim = true; }
-        unsafe {
-            let _ = SetTimer(hwnd, HOVER_ANIM_TIMER_ID, HOVER_ANIM_STEP_MS, None);
-        }
+    });
+    request_repaint();
+    if done {
+        vars(|v| v.animating.set(false));
+        unsafe { let _ = KillTimer(hwnd, HOVER_ANIM_TIMER_ID); }
     }
 }
 
-/// Pinta el contenido del panel (fondo, miniaturas o carrusel, barra y avisos) en `dc`.
-/// Lienzo fuera de pantalla (DC, bitmap, bitmap original, ancho, alto). Se crea al pintar
-/// la primera vez y se reutiliza en cada fotograma hasta que el panel se oculta.
-static PANEL_BACKBUFFER: Mutex<Option<(isize, isize, isize, i32, i32)>> = Mutex::new(None);
+/// Dibuja los botones "favorita" y "quitar de la galería" en la esquina superior derecha.
+unsafe fn draw_item_buttons(dc: HDC, index: usize, right: i32, top: i32, favorite: bool, hot: Option<ItemButton>) -> ItemButtons {
+    use windows::Win32::Graphics::Gdi::{CreateEllipticRgn, CreatePen, CreatePolygonRgn, FillRgn, LineTo, MoveToEx, FrameRgn as Frame, PS_SOLID, WINDING};
+    let size = px(BASE_BUTTON);
+    let gap = px(BASE_BUTTON_GAP);
+    let inset = px(6);
+    let exclude = RECT { left: right - inset - size, top: top + inset, right: right - inset, bottom: top + inset + size };
+    let favorite_rect = RECT { left: exclude.left - gap - size, top: exclude.top, right: exclude.left - gap, bottom: exclude.bottom };
+    for (rect, button) in [(favorite_rect, ItemButton::Favorite), (exclude, ItemButton::Exclude)] {
+        let rgn = CreateEllipticRgn(rect.left, rect.top, rect.right + 1, rect.bottom + 1);
+        let fill = CreateSolidBrush(if hot == Some(button) { COLOR_BUTTON_HOT } else { COLOR_BUTTON_BG });
+        let border = CreateSolidBrush(COLOR_BUTTON_BORDER);
+        let _ = FillRgn(dc, rgn, fill);
+        let _ = Frame(dc, rgn, border, 1, 1);
+        let _ = DeleteObject(fill);
+        let _ = DeleteObject(border);
+        let _ = DeleteObject(rgn);
+    }
+    // Estrella: dorada si ya es favorita.
+    let (cx, cy) = ((favorite_rect.left + favorite_rect.right) as f32 / 2.0, (favorite_rect.top + favorite_rect.bottom) as f32 / 2.0);
+    let radius = size as f32 * 0.32;
+    let points: Vec<POINT> = (0..10).map(|i| {
+        let r = if i % 2 == 0 { radius } else { radius * 0.45 };
+        let angle = -std::f32::consts::FRAC_PI_2 + i as f32 * std::f32::consts::PI / 5.0;
+        POINT { x: (cx + r * angle.cos()).round() as i32, y: (cy + r * angle.sin()).round() as i32 }
+    }).collect();
+    let star = CreatePolygonRgn(&points, WINDING);
+    let star_brush = CreateSolidBrush(if favorite { COLOR_FAVORITE } else { COLOR_BUTTON_GLYPH });
+    let _ = FillRgn(dc, star, star_brush);
+    let _ = DeleteObject(star_brush);
+    let _ = DeleteObject(star);
+    // Aspa de "quitar".
+    let pen = CreatePen(PS_SOLID, px(2).max(1), COLOR_BUTTON_GLYPH);
+    let old_pen = SelectObject(dc, pen);
+    let arm = size * 22 / 100;
+    let (x, y) = ((exclude.left + exclude.right) / 2, (exclude.top + exclude.bottom) / 2);
+    let _ = MoveToEx(dc, x - arm, y - arm, None);
+    let _ = LineTo(dc, x + arm, y + arm);
+    let _ = MoveToEx(dc, x + arm, y - arm, None);
+    let _ = LineTo(dc, x - arm, y + arm);
+    SelectObject(dc, old_pen);
+    let _ = DeleteObject(pen);
+    ItemButtons { index, favorite: favorite_rect, exclude }
+}
 
-unsafe fn backbuffer_dc(hdc: windows::Win32::Graphics::Gdi::HDC, width: i32, height: i32) -> Option<windows::Win32::Graphics::Gdi::HDC> {
-    use windows::Win32::Graphics::Gdi::HDC;
-    let current = PANEL_BACKBUFFER.lock().ok().and_then(|g| *g);
-    if let Some((dc, _, _, w, h)) = current {
-        if w == width && h == height { return Some(HDC(dc as *mut _)); }
+/// Botón bajo el punto (coordenadas de cliente), según el último fotograma pintado.
+fn button_at(x: i32, y: i32) -> Option<(usize, ItemButton)> {
+    let buttons = vars(|v| v.buttons.get())?;
+    buttons.at(x, y).map(|button| (buttons.index, button))
+}
+
+/// Actualiza el objetivo de animación hover/foco para las miniaturas e inicia el temporizador de interpolación.
+fn set_hover_target(hwnd: HWND, new_hover: Option<usize>) {
+    if vars(|v| v.hover.replace(new_hover)) == new_hover {
+        return;
+    }
+    let n = image_count();
+    if n > 0 {
+        vars(|v| {
+            v.scales.borrow_mut().resize(n, 1.0);
+            let mut targets = v.targets.borrow_mut();
+            targets.clear();
+            targets.resize(n, 1.0);
+            if let Some(idx) = new_hover.filter(|idx| *idx < n) {
+                targets[idx] = focus_scale();
+            }
+        });
+        start_animation(hwnd);
+    }
+}
+
+unsafe fn backbuffer_dc(hdc: HDC, width: i32, height: i32) -> Option<HDC> {
+    if let Some(buffer) = vars(|v| v.backbuffer.get()) {
+        if buffer.width == width && buffer.height == height { return Some(buffer.dc); }
         release_backbuffer();
     }
     let dc = CreateCompatibleDC(hdc);
-    let bmp = CreateCompatibleBitmap(hdc, width, height);
-    if dc.is_invalid() || bmp.is_invalid() {
-        let _ = DeleteObject(bmp);
+    let bitmap = CreateCompatibleBitmap(hdc, width, height);
+    if dc.is_invalid() || bitmap.is_invalid() {
+        let _ = DeleteObject(bitmap);
         let _ = DeleteDC(dc);
         return None;
     }
-    let old = SelectObject(dc, bmp);
-    if let Ok(mut g) = PANEL_BACKBUFFER.lock() { *g = Some((dc.0 as isize, bmp.0 as isize, old.0 as isize, width, height)); }
+    let old = SelectObject(dc, bitmap);
+    vars(|v| v.backbuffer.set(Some(Backbuffer { dc, bitmap, old, width, height })));
     Some(dc)
 }
 
 fn release_backbuffer() {
-    use windows::Win32::Graphics::Gdi::{HDC, HGDIOBJ};
-    if let Some((dc, bmp, old, _, _)) = PANEL_BACKBUFFER.lock().ok().and_then(|mut g| g.take()) {
+    if let Some(buffer) = vars(|v| v.backbuffer.take()) {
         unsafe {
-            SelectObject(HDC(dc as *mut _), HGDIOBJ(old as *mut _));
-            let _ = DeleteObject(HGDIOBJ(bmp as *mut _));
-            let _ = DeleteDC(HDC(dc as *mut _));
+            SelectObject(buffer.dc, buffer.old);
+            let _ = DeleteObject(buffer.bitmap);
+            let _ = DeleteDC(buffer.dc);
         }
     }
 }
@@ -377,8 +601,7 @@ fn strip_visible_range(count: usize, viewport: i32, scroll: i32, vertical: bool)
 /// En modo bajo demanda: pide las miniaturas visibles y las de alrededor, y expulsa
 /// las usadas hace más tiempo cuando se supera la capacidad.
 fn load_thumbnails_on_demand(images: &[ScannedImage], cache: &ThumbnailCache, visible: std::ops::Range<usize>) {
-    use std::sync::atomic::Ordering;
-    if !PANEL_THUMBS_ON_DEMAND.load(Ordering::Relaxed) || visible.is_empty() { return; }
+    if !vars(|v| v.thumbs_on_demand.get()) || visible.is_empty() { return; }
     // Margen de dos "pantallas" a cada lado para que el desplazamiento normal no muestre huecos.
     let margin = (visible.len() * 2).max(4);
     let wanted = visible.start.saturating_sub(margin)..(visible.end + margin).min(images.len());
@@ -387,29 +610,33 @@ fn load_thumbnails_on_demand(images: &[ScannedImage], cache: &ThumbnailCache, vi
     // Primero las visibles, luego las del margen.
     let order = images[visible.clone()].iter().chain(images[wanted.start..visible.start].iter().rev()).chain(images[visible.end..wanted.end].iter());
     let notify = crate::app::MAIN_HWND.lock().ok().and_then(|g| *g).map(|h| HWND(h as *mut _)).unwrap_or_default();
-    crate::thumbs::request_thumbnails(order.map(|img| img.path.as_path()), PANEL_THUMB_SIZE_PX.load(Ordering::Relaxed), cache, notify);
+    crate::thumbs::request_thumbnails(order.map(|img| img.path.as_path()), vars(|v| v.thumb_size_px.get()), cache, notify);
     cache.touch(keys.iter().map(|key| key.as_str()));
     cache.evict_to(ON_DEMAND_CAPACITY.max(keys.len()));
 }
 
 pub fn set_thumbnail_loading(on_demand: bool, size_px: i32) {
-    use std::sync::atomic::Ordering;
-    PANEL_THUMBS_ON_DEMAND.store(on_demand, Ordering::Relaxed);
-    PANEL_THUMB_SIZE_PX.store(size_px, Ordering::Relaxed);
+    vars(|v| {
+        v.thumbs_on_demand.set(on_demand);
+        v.thumb_size_px.set(size_px);
+    });
 }
 
-unsafe fn paint_contents(dc: windows::Win32::Graphics::Gdi::HDC, hwnd: HWND, width: i32, height: i32) {
+unsafe fn paint_contents(dc: HDC, hwnd: HWND, width: i32, height: i32) {
     let bg = CreateSolidBrush(COLOR_BACKGROUND);
     let _ = FillRect(dc, &RECT { left: 0, top: 0, right: width, bottom: height }, bg);
     let _ = DeleteObject(bg);
 
-    let cache_opt = if let Ok(g) = PANEL_THUMB_CACHE.lock() { g.clone() } else { None };
-    let images_opt = if let Ok(g) = PANEL_SCANNED.lock() { g.clone() } else { None };
-    let scroll = if let Ok(g) = PANEL_SCROLL_OFFSET.lock() { *g } else { 0 };
+    let cache_opt = vars(|v| v.thumb_cache.borrow().clone());
+    let images_opt = scanned();
+    let scroll = vars(|v| v.scroll.get());
     let vertical = is_vertical();
-    let hover = if let Ok(g) = PANEL_HOVER_INDEX.lock() { *g } else { None };
-    let current_wp = if let Ok(g) = PANEL_CURRENT_WALLPAPER.lock() { g.clone() } else { None };
-    let selected = if let Ok(g) = PANEL_SELECTED_INDEX.lock() { *g } else { None };
+    let hover = vars(|v| v.hover.get());
+    let current_wp = vars(|v| v.current_wallpaper.borrow().clone());
+    let selected = vars(|v| v.selected.get());
+    let scales = vars(|v| v.scales.borrow().clone());
+    let hot_button = vars(|v| v.hot_button.get());
+    let mut buttons = None;
 
     if let (Some(cache), Some(images)) = (cache_opt.as_ref(), images_opt.as_ref().and_then(|arc| arc.lock().ok())) {
         let visible = match carousel::layout().filter(|_| is_carousel()) {
@@ -421,8 +648,7 @@ unsafe fn paint_contents(dc: windows::Win32::Graphics::Gdi::HDC, hwnd: HWND, wid
 
     if is_carousel() {
         if let Some(images) = images_opt.as_ref().and_then(|arc| arc.lock().ok()) {
-            let scales = PANEL_THUMB_SCALES.lock().map(|v| v.clone()).unwrap_or_default();
-            carousel::paint(dc, width, height, &carousel::PaintInput {
+            buttons = carousel::paint(dc, width, height, &carousel::PaintInput {
                 images: &images,
                 small_thumbs: cache_opt.as_ref(),
                 scroll,
@@ -430,6 +656,7 @@ unsafe fn paint_contents(dc: windows::Win32::Graphics::Gdi::HDC, hwnd: HWND, wid
                 current: current_wp.as_deref(),
                 scales: &scales,
                 notify: hwnd,
+                hot_button,
             });
         }
     } else if let (Some(cache), Some(images_arc)) = (cache_opt, images_opt) {
@@ -445,7 +672,7 @@ unsafe fn paint_contents(dc: windows::Win32::Graphics::Gdi::HDC, hwnd: HWND, wid
                 let (start, size) = if vertical { (base_y, thumb_h()) } else { (base_x, thumb_w()) };
                 if start + size <= 0 || start >= viewport { continue; }
                 let key = img.path.to_string_lossy().to_string();
-                let scale = PANEL_THUMB_SCALES.lock().ok().and_then(|v| v.get(idx).copied()).unwrap_or(1.0);
+                let scale = scales.get(idx).copied().unwrap_or(1.0);
                 let draw_w = ((thumb_w() as f32 * scale) as i32).max(1);
                 let draw_h = ((thumb_h() as f32 * scale) as i32).max(1);
                 let draw_x = base_x + (thumb_w() - draw_w) / 2;
@@ -470,7 +697,7 @@ unsafe fn paint_contents(dc: windows::Win32::Graphics::Gdi::HDC, hwnd: HWND, wid
                     let _ = DeleteObject(ph);
                 }
                 let _ = SelectClipRgn(dc, windows::Win32::Graphics::Gdi::HRGN(std::ptr::null_mut()));
-                let is_current = current_wp.as_ref().map(|p| p == &img.path).unwrap_or(false);
+                let is_current = current_wp.as_ref().is_some_and(|p| same_path(p, &img.path));
                 let frame = if focus == Some(idx) {
                     Some(COLOR_FOCUS)
                 } else if is_current {
@@ -484,14 +711,21 @@ unsafe fn paint_contents(dc: windows::Win32::Graphics::Gdi::HDC, hwnd: HWND, wid
                     let _ = DeleteObject(brush);
                 }
                 let _ = DeleteObject(rgn);
-                if img.is_new {
-                    draw_new_badge(dc, draw_x + draw_w, draw_y);
+                if hover == Some(idx) {
+                    // La imagen con el ratón encima muestra sus botones (que ya indican si es favorita).
+                    buttons = Some(draw_item_buttons(dc, idx, draw_x + draw_w, draw_y, img.is_favorite, hot_button));
+                } else {
+                    if img.is_new {
+                        draw_new_badge(dc, draw_x + draw_w, draw_y);
+                    }
+                    if img.is_favorite {
+                        draw_favorite_badge(dc, draw_x, draw_y);
+                    }
                 }
             }
             let _ = DeleteDC(bmp_dc);
             let total_main = thumbnail_content_extent(images.len(), vertical);
-            let show_scrollbar = PANEL_SHOW_SCROLLBAR.lock().map(|show| *show).unwrap_or(true);
-            if show_scrollbar && total_main > viewport {
+            if vars(|v| v.show_scrollbar.get()) && total_main > viewport {
                 let track_brush = CreateSolidBrush(COLOR_SCROLL_TRACK);
                 let thumb_brush = CreateSolidBrush(COLOR_SCROLL_THUMB);
                 let max_scroll = (total_main - viewport).max(1);
@@ -518,8 +752,71 @@ unsafe fn paint_contents(dc: windows::Win32::Graphics::Gdi::HDC, hwnd: HWND, wid
         }
     }
 
+    vars(|v| v.buttons.set(buttons));
+
     if image_count() == 0 {
         draw_empty_state(dc, width, height);
+    }
+}
+
+/// Rectángulo del monitor donde está el panel.
+unsafe fn panel_monitor_rect(hwnd: HWND) -> RECT {
+    let hmon = windows::Win32::Graphics::Gdi::MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    let mut monitor = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+    let _ = GetMonitorInfoW(hmon, &mut monitor);
+    monitor.rcMonitor
+}
+
+/// Menú contextual de una miniatura (aplicar, monitor, bloqueo, favorita, Explorador, papelera).
+unsafe fn show_thumbnail_menu(hwnd: HWND, index: usize) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        AppendMenuW, CreatePopupMenu, DestroyMenu, GetSystemMetrics, TrackPopupMenu, MF_SEPARATOR, MF_STRING, SM_CMONITORS,
+        TPM_RETURNCMD, TPM_RIGHTBUTTON,
+    };
+    let Some((path, favorite)) = scanned().and_then(|arc| arc.lock().ok()
+        .and_then(|images| images.get(index).map(|img| (img.path.clone(), img.is_favorite)))) else { return; };
+    let Ok(menu) = CreatePopupMenu() else { return; };
+    let item = |id: usize, key: &str| {
+        let text = to_wide_chars(&crate::i18n::t(key));
+        let _ = AppendMenuW(menu, MF_STRING, id, as_pcwstr(&text));
+    };
+    item(IDM_APPLY, "Set as wallpaper");
+    if GetSystemMetrics(SM_CMONITORS) > 1 {
+        item(IDM_APPLY_MONITOR, "Set on this monitor only");
+    }
+    item(IDM_LOCK_SCREEN, "Set as lock screen");
+    item(IDM_FAVORITE, if favorite { "Remove from favorites" } else { "Add to favorites" });
+    let _ = AppendMenuW(menu, MF_SEPARATOR, 0, windows::core::PCWSTR::null());
+    item(IDM_REVEAL, "Show in Explorer");
+    item(IDM_EXCLUDE, "Remove from gallery");
+
+    let mut pt = POINT::default();
+    let _ = GetCursorPos(&mut pt);
+    vars(|v| v.menu_open.set(true));
+    let selected = TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_RETURNCMD, pt.x, pt.y, 0, hwnd, None);
+    vars(|v| v.menu_open.set(false));
+    let _ = DestroyMenu(menu);
+
+    match selected.0 as usize {
+        IDM_APPLY => {
+            app::request(app::Action::ApplyFromPanel(path, panel_monitor_rect(hwnd)));
+            hide_panel();
+        }
+        IDM_APPLY_MONITOR => {
+            app::request(app::Action::ApplyToMonitor(path, panel_monitor_rect(hwnd)));
+            hide_panel();
+        }
+        IDM_LOCK_SCREEN => {
+            app::request(app::Action::LockScreen(path));
+            hide_panel();
+        }
+        IDM_FAVORITE => app::request(app::Action::ToggleFavorite(path)),
+        IDM_REVEAL => {
+            app::request(app::Action::Reveal(path));
+            hide_panel();
+        }
+        IDM_EXCLUDE => app::request(app::Action::Exclude(path)),
+        _ => {}
     }
 }
 
@@ -537,37 +834,30 @@ unsafe extern "system" fn panel_wnd_proc(
         WM_TIMER => {
             if wparam.0 == ANIM_TIMER_ID {
                 let mut should_hide = false;
-                if let Ok(mut stg) = PANEL_STATE.lock() {
-                    if let Some(ref mut st) = *stg {
-                        if st.animating {
-                            let elapsed = st.anim_start_time.elapsed().as_millis() as f32;
-                            let progress = (elapsed / (ANIM_DURATION_MS as f32)).min(1.0);
-                            let eased = 1.0 - (1.0 - progress).powi(3);
-                            let x = st.start_x + ((st.target_x - st.start_x) as f32 * eased) as i32;
-                            let y = st.start_y + ((st.target_y - st.start_y) as f32 * eased) as i32;
-                            st.current_x = x;
-                            st.current_y = y;
-                            let pw = if let Ok(g) = PANEL_WIDTH.lock() { *g } else { 800 };
-                            let ph = if let Ok(g) = PANEL_HEIGHT.lock() { *g } else { 150 };
-                            let _ = SetWindowPos(hwnd, HWND_TOPMOST, x, y, pw, ph, SWP_NOACTIVATE | SWP_NOZORDER);
-                            if is_carousel() {
-                                let exiting = PANEL_EXITING.lock().map(|e| *e).unwrap_or(false);
-                                let opacity = if exiting { 1.0 - eased } else { eased };
-                                set_panel_alpha(hwnd, (opacity * 255.0) as u8);
-                            }
-                            if progress >= 1.0 {
-                                st.animating = false;
-                                let _ = KillTimer(hwnd, ANIM_TIMER_ID);
-                                should_hide = if let Ok(e) = PANEL_EXITING.lock() { *e } else { false };
-                            }
-                        }
+                if let Some(slide) = vars(|v| v.slide.get()) {
+                    let elapsed = slide.anim_start_time.elapsed().as_millis() as f32;
+                    let progress = (elapsed / (ANIM_DURATION_MS as f32)).min(1.0);
+                    let eased = 1.0 - (1.0 - progress).powi(3);
+                    let x = slide.start_x + ((slide.target_x - slide.start_x) as f32 * eased) as i32;
+                    let y = slide.start_y + ((slide.target_y - slide.start_y) as f32 * eased) as i32;
+                    let (pw, ph) = vars(|v| (v.width.get(), v.height.get()));
+                    let _ = SetWindowPos(hwnd, HWND_TOPMOST, x, y, pw, ph, SWP_NOACTIVATE | SWP_NOZORDER);
+                    if is_carousel() {
+                        let opacity = if vars(|v| v.exiting.get()) { 1.0 - eased } else { eased };
+                        set_panel_alpha(hwnd, (opacity * 255.0) as u8);
+                    }
+                    if progress >= 1.0 {
+                        vars(|v| v.slide.set(None));
+                        let _ = KillTimer(hwnd, ANIM_TIMER_ID);
+                        should_hide = vars(|v| v.exiting.get());
                     }
                 }
                 if should_hide {
-                    let _ = windows::Win32::UI::WindowsAndMessaging::ShowWindow(hwnd, windows::Win32::UI::WindowsAndMessaging::SW_HIDE);
-                    if let Ok(mut v) = PANEL_VISIBLE.lock() { *v = false; }
-                    if let Ok(mut e) = PANEL_EXITING.lock() { *e = false; }
-                    if let Ok(mut stg) = PANEL_STATE.lock() { *stg = None; }
+                    let _ = ShowWindow(hwnd, windows::Win32::UI::WindowsAndMessaging::SW_HIDE);
+                    vars(|v| {
+                        v.visible.set(false);
+                        v.exiting.set(false);
+                    });
                     release_backbuffer();
                     if is_carousel() {
                         let _ = SetTimer(hwnd, TILE_RELEASE_TIMER_ID, TILE_RELEASE_DELAY_MS, None);
@@ -582,77 +872,47 @@ unsafe extern "system" fn panel_wnd_proc(
                 return LRESULT(0);
             }
             if wparam.0 == HOVER_ANIM_TIMER_ID {
-                let mut done = true;
-                if let Ok(mut target) = PANEL_SCROLL_TARGET.lock() {
-                    if let Some(goal) = *target {
-                        if let Ok(mut scroll) = PANEL_SCROLL_OFFSET.lock() {
-                            let diff = goal - *scroll;
-                            if diff.abs() <= 1 {
-                                *scroll = goal;
-                                *target = None;
-                            } else {
-                                let step = (diff as f32 * 0.25) as i32;
-                                *scroll += if step == 0 { diff.signum() } else { step };
-                                done = false;
-                            }
-                        }
-                    }
-                }
-                if let (Ok(mut scales), Ok(targets)) = (PANEL_THUMB_SCALES.lock(), PANEL_THUMB_TARGETS.lock()) {
-                    for i in 0..scales.len().min(targets.len()) {
-                        let diff = targets[i] - scales[i];
-                        if diff.abs() > 0.001 {
-                            scales[i] += diff * 0.25;
-                            done = false;
-                        } else {
-                            scales[i] = targets[i];
-                        }
-                    }
-                }
-                let _ = windows::Win32::Graphics::Gdi::InvalidateRect(hwnd, None, true);
-                if done {
-                    if let Ok(mut a) = PANEL_THUMB_ANIM.lock() { *a = false; }
-                    let _ = KillTimer(hwnd, HOVER_ANIM_TIMER_ID);
-                }
+                advance_animation(hwnd);
                 return LRESULT(0);
             }
             if wparam.0 == AUTO_CLOSE_TIMER_ID {
+                // Con un menú contextual abierto el cursor sale del panel: no cerrarlo.
+                if vars(|v| v.menu_open.get()) {
+                    return LRESULT(0);
+                }
                 // El modo del sensor cierra al salir; el modo de atajo espera un clic fuera.
                 let mut pt = POINT::default();
                 let _ = GetCursorPos(&mut pt);
                 let mut rect = RECT::default();
                 let _ = GetWindowRect(hwnd, &mut rect);
-                let close_on_leave = PANEL_CLOSE_ON_MOUSE_LEAVE.lock().map(|value| *value).unwrap_or(true);
+                let close_on_leave = vars(|v| v.close_on_mouse_leave.get());
                 let mut inside = pt.x >= rect.left && pt.x < rect.right && pt.y >= rect.top && pt.y < rect.bottom;
                 if inside && is_carousel() {
                     // Los huecos entre tarjetas son transparentes: un clic ahí cuenta como fuera.
                     inside = thumbnail_at(pt.x - rect.left, pt.y - rect.top).is_some();
                 }
                 if close_on_leave && !inside {
-                    let side = PANEL_SIDE.lock().map(|value| *value).unwrap_or(PanelSide::Top);
-                    let hmon = windows::Win32::Graphics::Gdi::MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
-                    let mut monitor = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
-                    let _ = GetMonitorInfoW(hmon, &mut monitor);
-                    let margin = PANEL_MARGIN.lock().map(|value| *value).unwrap_or(0);
-                    let monitor_width = monitor.rcMonitor.right - monitor.rcMonitor.left;
-                    let monitor_height = monitor.rcMonitor.bottom - monitor.rcMonitor.top;
-                    let margin = effective_panel_margin(side, margin, monitor_width, monitor_height);
+                    let side = vars(|v| v.side.get());
+                    let monitor = panel_monitor_rect(hwnd);
+                    let monitor_width = monitor.right - monitor.left;
+                    let monitor_height = monitor.bottom - monitor.top;
+                    let margin = effective_panel_margin(side, vars(|v| v.margin.get()), monitor_width, monitor_height);
                     let grace = margin.saturating_add(px(BASE_CLOSE_GRACE));
                     inside = match side {
                         PanelSide::Top => {
                             pt.x >= rect.left && pt.x < rect.right
-                                && pt.y >= monitor.rcMonitor.top
-                                && pt.y < (monitor.rcMonitor.top + grace).min(monitor.rcMonitor.bottom)
+                                && pt.y >= monitor.top
+                                && pt.y < (monitor.top + grace).min(monitor.bottom)
                         }
                         PanelSide::Left => {
-                            pt.y >= monitor.rcMonitor.top && pt.y < monitor.rcMonitor.bottom
-                                && pt.x >= monitor.rcMonitor.left
-                                && pt.x < (monitor.rcMonitor.left + grace).min(monitor.rcMonitor.right)
+                            pt.y >= monitor.top && pt.y < monitor.bottom
+                                && pt.x >= monitor.left
+                                && pt.x < (monitor.left + grace).min(monitor.right)
                         }
                         PanelSide::Right => {
-                            pt.y >= monitor.rcMonitor.top && pt.y < monitor.rcMonitor.bottom
-                                && pt.x >= (monitor.rcMonitor.right - grace).max(monitor.rcMonitor.left)
-                                && pt.x < monitor.rcMonitor.right
+                            pt.y >= monitor.top && pt.y < monitor.bottom
+                                && pt.x >= (monitor.right - grace).max(monitor.left)
+                                && pt.x < monitor.right
                         }
                     };
                 }
@@ -669,54 +929,60 @@ unsafe extern "system" fn panel_wnd_proc(
         }
         WM_PAINT => {
             let mut ps = windows::Win32::Graphics::Gdi::PAINTSTRUCT::default();
-            unsafe {
-                let hdc = BeginPaint(hwnd, &mut ps);
-                let mut rect = RECT::default();
-                let _ = windows::Win32::UI::WindowsAndMessaging::GetClientRect(hwnd, &mut rect);
-                let width = rect.right - rect.left;
-                let height = rect.bottom - rect.top;
-
-                if let Some(mem_dc) = backbuffer_dc(hdc, width, height) {
-                    paint_contents(mem_dc, hwnd, width, height);
-                    let _ = BitBlt(hdc, 0, 0, width, height, mem_dc, 0, 0, SRCCOPY);
-                }
-                let _ = EndPaint(hwnd, &ps);
+            let hdc = BeginPaint(hwnd, &mut ps);
+            let mut rect = RECT::default();
+            let _ = windows::Win32::UI::WindowsAndMessaging::GetClientRect(hwnd, &mut rect);
+            let width = rect.right - rect.left;
+            let height = rect.bottom - rect.top;
+            if let Some(mem_dc) = backbuffer_dc(hdc, width, height) {
+                paint_contents(mem_dc, hwnd, width, height);
+                let _ = BitBlt(hdc, 0, 0, width, height, mem_dc, 0, 0, SRCCOPY);
             }
+            let _ = EndPaint(hwnd, &ps);
             LRESULT(0)
         }
         WM_LBUTTONDOWN => {
             let x = (lparam.0 & 0xFFFF) as i16 as i32;
             let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
             let vertical = is_vertical();
-            if let Ok(mut g) = PANEL_DRAGGING.lock() { *g = true; }
-            if let Ok(mut g) = PANEL_LAST_MOUSE_X.lock() { *g = if vertical { y } else { x }; }
-            if let Ok(mut g) = PANEL_DRAG_START_X.lock() { *g = x; }
-            if let Ok(mut g) = PANEL_DRAG_START_Y.lock() { *g = y; }
+            vars(|v| {
+                v.dragging.set(true);
+                v.last_mouse.set(if vertical { y } else { x });
+                v.drag_start.set((x, y));
+            });
             LRESULT(0)
         }
         WM_LBUTTONUP => {
-            let was_dragging = if let Ok(mut g) = PANEL_DRAGGING.lock() {
-                let was = *g;
-                *g = false;
-                was
-            } else { false };
-
-            let start_x = if let Ok(g) = PANEL_DRAG_START_X.lock() { *g } else { 0 };
-            let start_y = if let Ok(g) = PANEL_DRAG_START_Y.lock() { *g } else { 0 };
+            let was_dragging = vars(|v| v.dragging.replace(false));
+            let (start_x, start_y) = vars(|v| v.drag_start.get());
             let x = (lparam.0 & 0xFFFF) as i16 as i32;
             let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
 
             // Si el cursor se movió 5 px o menos, es un clic sobre la miniatura
             if was_dragging && (x - start_x).abs() <= 5 && (y - start_y).abs() <= 5 {
-                if let Some(idx) = thumbnail_at(x, y) {
-                    let path = PANEL_SCANNED.lock().ok().and_then(|g| g.clone())
-                        .and_then(|arc| arc.lock().ok().and_then(|v| v.get(idx).map(|img| img.path.clone())));
-                    if let Some(path) = path {
+                if let Some((idx, button)) = button_at(x, y) {
+                    // Los botones actúan sobre la imagen sin aplicarla ni cerrar el panel.
+                    if let Some(path) = image_path(idx) {
+                        match button {
+                            ItemButton::Favorite => app::request(app::Action::ToggleFavorite(path)),
+                            ItemButton::Exclude => app::request(app::Action::Exclude(path)),
+                        }
+                    }
+                } else if let Some(idx) = thumbnail_at(x, y) {
+                    if let Some(path) = image_path(idx) {
                         log_info!("Panel: clic en miniatura {} -> {:?}", idx, path);
-                        app::request_apply_wallpaper(&path);
+                        app::request(app::Action::ApplyFromPanel(path, panel_monitor_rect(hwnd)));
                         hide_panel();
                     }
                 }
+            }
+            LRESULT(0)
+        }
+        WM_RBUTTONUP => {
+            let x = (lparam.0 & 0xFFFF) as i16 as i32;
+            let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
+            if let Some(idx) = thumbnail_at(x, y) {
+                show_thumbnail_menu(hwnd, idx);
             }
             LRESULT(0)
         }
@@ -724,23 +990,33 @@ unsafe extern "system" fn panel_wnd_proc(
             let x = (lparam.0 & 0xFFFF) as i16 as i32;
             let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
             let vertical = is_vertical();
-            set_hover_target(hwnd, thumbnail_at(x, y));
-
-            // Drag scroll (solo si está arrastrando)
-            let dragging = if let Ok(g) = PANEL_DRAGGING.lock() { *g } else { false };
-            if dragging {
-                let last = if let Ok(g) = PANEL_LAST_MOUSE_X.lock() { *g } else { 0 };
-                let axis = if vertical { y } else { x };
-                let delta = last - axis;
-                let max_scroll = max_scroll(image_count());
-                if let Ok(mut target) = PANEL_SCROLL_TARGET.lock() { *target = None; }
-                if let Ok(mut g) = PANEL_SCROLL_OFFSET.lock() {
-                    // Clamp: no se puede scrollear más allá del final de las imágenes
-                    *g = (*g + delta).max(0).min(max_scroll);
-                }
-                if let Ok(mut g) = PANEL_LAST_MOUSE_X.lock() { *g = axis; }
+            let dragging = vars(|v| v.dragging.get());
+            // Sobre un botón el foco se queda en su imagen (el botón puede sobresalir un poco).
+            let over_button = if dragging { None } else { button_at(x, y) };
+            let hover = over_button.map(|(index, _)| index).or_else(|| thumbnail_at(x, y));
+            set_hover_target(hwnd, hover);
+            let hot = over_button.map(|(_, button)| button);
+            if vars(|v| v.hot_button.replace(hot)) != hot {
+                request_repaint();
             }
-            request_repaint();
+
+            if dragging {
+                let axis = if vertical { y } else { x };
+                let delta = vars(|v| v.last_mouse.replace(axis)) - axis;
+                if delta != 0 {
+                    let max_scroll = max_scroll(image_count());
+                    vars(|v| {
+                        v.scroll_target.set(None);
+                        // Clamp: no se puede scrollear más allá del final de las imágenes
+                        v.scroll.set((v.scroll.get() + delta).max(0).min(max_scroll));
+                    });
+                    request_repaint();
+                }
+            }
+            // Con el ratón en movimiento los WM_TIMER pueden no llegar: avanzar desde aquí.
+            if vars(|v| v.anim_last.get()).is_some_and(|last| last.elapsed().as_millis() >= HOVER_ANIM_STEP_MS as u128) {
+                advance_animation(hwnd);
+            }
             LRESULT(0)
         }
         0x020A => { // WM_MOUSEWHEEL
@@ -752,16 +1028,17 @@ unsafe extern "system" fn panel_wnd_proc(
             }
             let scroll_delta = if delta > 0 { -30 } else { 30 };
             let max_scroll = max_scroll(image_count());
-            if let Ok(mut g) = PANEL_SCROLL_OFFSET.lock() {
+            vars(|v| {
+                let current = v.scroll.get();
                 // Al seguir girando en un extremo se salta al otro.
-                *g = if max_scroll > 0 && *g >= max_scroll && scroll_delta > 0 {
+                v.scroll.set(if max_scroll > 0 && current >= max_scroll && scroll_delta > 0 {
                     0
-                } else if max_scroll > 0 && *g <= 0 && scroll_delta < 0 {
+                } else if max_scroll > 0 && current <= 0 && scroll_delta < 0 {
                     max_scroll
                 } else {
-                    (*g + scroll_delta).max(0).min(max_scroll)
-                };
-            }
+                    (current + scroll_delta).max(0).min(max_scroll)
+                });
+            });
             request_repaint();
             LRESULT(0)
         }
@@ -775,20 +1052,21 @@ unsafe extern "system" fn panel_wnd_proc(
             let previous_key = if vertical { 0x26 } else { 0x25 };
             let next_key = if vertical { 0x28 } else { 0x27 };
             if key == previous_key || key == next_key || key == 0x0D {
-                let count = image_count();
-                if count == 0 { return LRESULT(0); }
-                let sel = PANEL_SELECTED_INDEX.lock().ok().and_then(|g| *g).unwrap_or(0);
+                if image_count() == 0 { return LRESULT(0); }
+                let sel = vars(|v| v.selected.get()).unwrap_or(0);
                 if key == previous_key || key == next_key {
                     step_selection(hwnd, key == next_key);
-                } else { // Enter -> aplicar y cerrar panel
-                    let path = PANEL_SCANNED.lock().ok().and_then(|g| g.clone())
-                        .and_then(|arc| arc.lock().ok().and_then(|v| v.get(sel).map(|img| img.path.clone())));
-                    if let Some(p) = path {
-                        log_info!("Panel: Enter en miniatura {} -> {:?}", sel, p);
-                        crate::app::request_apply_wallpaper(&p);
-                        crate::panel::set_current_wallpaper(&p);
-                        hide_panel();
-                    }
+                } else if let Some(p) = image_path(sel) { // Enter -> aplicar y cerrar panel
+                    log_info!("Panel: Enter en miniatura {} -> {:?}", sel, p);
+                    app::request(app::Action::ApplyFromPanel(p.clone(), panel_monitor_rect(hwnd)));
+                    set_current_wallpaper(&p);
+                    hide_panel();
+                }
+                return LRESULT(0);
+            }
+            if key == 0x5D { // VK_APPS (tecla de menú): menú de la miniatura seleccionada
+                if let Some(sel) = vars(|v| v.selected.get()).filter(|sel| *sel < image_count()) {
+                    show_thumbnail_menu(hwnd, sel);
                 }
                 return LRESULT(0);
             }
@@ -803,10 +1081,8 @@ unsafe extern "system" fn panel_wnd_proc(
             LRESULT(0)
         }
         WM_SETCURSOR => {
-            unsafe {
-                if let Ok(hcur) = LoadCursorW(None, IDC_ARROW) {
-                    let _ = SetCursor(hcur);
-                }
+            if let Ok(hcur) = LoadCursorW(None, IDC_ARROW) {
+                let _ = SetCursor(hcur);
             }
             LRESULT(1)
         }
@@ -858,16 +1134,13 @@ pub fn show_panel_from_hotkey() {
 }
 
 pub fn set_panel_side(side: PanelSide) {
-    let old_side = PANEL_SIDE.lock().map(|current| *current).unwrap_or(PanelSide::Top);
-    if old_side == side { return; }
-    if let Ok(mut current) = PANEL_SIDE.lock() { *current = side; }
+    if vars(|v| v.side.replace(side)) == side { return; }
     reopen_if_visible();
 }
 
 pub fn set_panel_mode(mode: PanelMode) {
-    let old_mode = PANEL_MODE.lock().map(|current| *current).unwrap_or(PanelMode::LowPower);
+    let old_mode = vars(|v| v.mode.replace(mode));
     if old_mode == mode { return; }
-    if let Ok(mut current) = PANEL_MODE.lock() { *current = mode; }
     if old_mode == PanelMode::Pro { carousel::clear_tiles(); }
     reopen_if_visible();
 }
@@ -879,19 +1152,21 @@ pub fn set_pro_priority(priority: ProPriority) {
 /// Vuelve a mostrar el panel con la nueva disposición si estaba abierto.
 fn reopen_if_visible() {
     if is_panel_visible() {
-        let close_on_leave = PANEL_CLOSE_ON_MOUSE_LEAVE.lock().map(|value| *value).unwrap_or(true);
-        if let Some(hwnd_value) = PANEL_HWND.lock().ok().and_then(|value| *value) {
+        let close_on_leave = vars(|v| v.close_on_mouse_leave.get());
+        if let Some(hwnd) = vars(|v| v.hwnd.get()) {
             unsafe {
-                let hwnd = HWND(hwnd_value as *mut _);
                 let _ = KillTimer(hwnd, ANIM_TIMER_ID);
                 let _ = KillTimer(hwnd, AUTO_CLOSE_TIMER_ID);
                 let _ = KillTimer(hwnd, HOVER_ANIM_TIMER_ID);
                 let _ = ShowWindow(hwnd, windows::Win32::UI::WindowsAndMessaging::SW_HIDE);
+                vars(|v| v.animating.set(false));
             }
         }
-        if let Ok(mut visible) = PANEL_VISIBLE.lock() { *visible = false; }
-        if let Ok(mut exiting) = PANEL_EXITING.lock() { *exiting = false; }
-        if let Ok(mut state) = PANEL_STATE.lock() { *state = None; }
+        vars(|v| {
+            v.visible.set(false);
+            v.exiting.set(false);
+            v.slide.set(None);
+        });
         show_panel_with_close_on_mouse_leave(close_on_leave);
     }
 }
@@ -901,25 +1176,27 @@ pub fn clear_carousel_tiles() {
     carousel::clear_tiles();
 }
 
+/// Olvida las tarjetas del carrusel de estos archivos (se editaron y hay que regenerarlas).
+pub fn forget_tiles(keys: &std::collections::HashSet<String>) {
+    carousel::forget(keys);
+    request_repaint();
+}
+
 pub fn set_scrollbar_visible(visible: bool) {
-    if let Ok(mut show) = PANEL_SHOW_SCROLLBAR.lock() { *show = visible; }
+    vars(|v| v.show_scrollbar.set(visible));
     request_repaint();
 }
 
 pub fn set_panel_margin(margin: u32) {
-    if let Ok(mut current) = PANEL_MARGIN.lock() { *current = margin; }
+    vars(|v| v.margin.set(margin));
 }
 
 fn show_panel_with_close_on_mouse_leave(close_on_mouse_leave: bool) {
     unsafe {
-        if let Ok(v) = PANEL_VISIBLE.lock() {
-            if *v { return; }
-        }
+        if vars(|v| v.visible.get()) { return; }
         // El carrusel queda lejos del borde: solo se cierra con clic fuera, Esc o al elegir.
         let close_on_mouse_leave = close_on_mouse_leave && !is_carousel();
-        if let Ok(mut mode) = PANEL_CLOSE_ON_MOUSE_LEAVE.lock() {
-            *mode = close_on_mouse_leave;
-        }
+        vars(|v| v.close_on_mouse_leave.set(close_on_mouse_leave));
 
         // Posicion y dimensiones segun lado configurado y monitor actual
         let mut pt = POINT::default();
@@ -932,15 +1209,14 @@ fn show_panel_with_close_on_mouse_leave(close_on_mouse_leave: bool) {
         let _ = GetMonitorInfoW(hmon, &mut mi);
         let (mut dpi_x, mut dpi_y) = (96u32, 96u32);
         if windows::Win32::UI::HiDpi::GetDpiForMonitor(hmon, windows::Win32::UI::HiDpi::MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y).is_ok() {
-            PANEL_DPI.store(dpi_x.max(96), std::sync::atomic::Ordering::Relaxed);
+            vars(|v| v.dpi.set(dpi_x.max(96)));
         }
 
-        let side = PANEL_SIDE.lock().map(|value| *value).unwrap_or(PanelSide::Top);
+        let side = vars(|v| v.side.get());
         let vertical = is_vertical();
         let monitor_width = mi.rcMonitor.right - mi.rcMonitor.left;
         let monitor_height = mi.rcMonitor.bottom - mi.rcMonitor.top;
-        let requested_margin = PANEL_MARGIN.lock().map(|margin| *margin).unwrap_or(0);
-        let margin = effective_panel_margin(side, requested_margin, monitor_width, monitor_height);
+        let margin = effective_panel_margin(side, vars(|v| v.margin.get()), monitor_width, monitor_height);
         let layout = is_carousel().then(|| carousel::Layout::for_monitor(monitor_height));
         if let Some(layout) = layout { carousel::set_layout(layout); }
         let width = if vertical { thumb_w() + thumb_margin() * 2 + scrollbar_size() } else { monitor_width };
@@ -976,38 +1252,28 @@ fn show_panel_with_close_on_mouse_leave(close_on_mouse_leave: bool) {
         let item_extent = item_size + thumb_margin();
 
         // Calcular fondo seleccionado actual y posición de scroll centrada
-        let (selected_idx, initial_scroll, image_count) = {
-            let current_wp = PANEL_CURRENT_WALLPAPER.lock().ok().and_then(|g| g.clone());
-            let images_opt = PANEL_SCANNED.lock().ok().and_then(|g| g.clone());
-            if let Some(images_arc) = images_opt {
-                if let Ok(images) = images_arc.lock() {
-                    let count = images.len();
-                    let idx = if let Some(ref cur_path) = current_wp {
-                        images.iter().position(|img| &img.path == cur_path).unwrap_or(0)
-                    } else {
-                        0
-                    };
-                    let scroll = if let Some(layout) = layout {
-                        layout.loop_center_scroll(idx as i64, viewport)
-                    } else {
-                        let item_x = idx as i32 * item_extent + thumb_margin();
-                        let center_scroll = (item_x + item_size / 2) - (viewport / 2);
-                        let max_scroll = (thumbnail_content_extent(count, vertical) - viewport).max(0);
-                        center_scroll.clamp(0, max_scroll)
-                    };
-                    (idx, scroll, count)
+        let current_wp = vars(|v| v.current_wallpaper.borrow().clone());
+        let (selected_idx, initial_scroll, image_count) = scanned()
+            .and_then(|arc| arc.lock().ok().map(|images| {
+                let count = images.len();
+                let idx = current_wp.as_ref()
+                    .and_then(|cur| images.iter().position(|img| same_path(&img.path, cur)))
+                    .unwrap_or(0);
+                let scroll = if let Some(layout) = layout {
+                    layout.loop_center_scroll(idx as i64, viewport)
                 } else {
-                    (0, 0, 0)
-                }
-            } else {
-                (0, 0, 0)
-            }
-        };
+                    let item_x = idx as i32 * item_extent + thumb_margin();
+                    let center_scroll = (item_x + item_size / 2) - (viewport / 2);
+                    let max_scroll = (thumbnail_content_extent(count, vertical) - viewport).max(0);
+                    center_scroll.clamp(0, max_scroll)
+                };
+                (idx, scroll, count)
+            }))
+            .unwrap_or((0, 0, 0));
 
         // Reutilizar ventana cacheada si existe
-        let cached = PANEL_HWND.lock().ok().and_then(|g| *g);
-        let hwnd = if let Some(hwnd_val) = cached {
-            HWND(hwnd_val as *mut _)
+        let hwnd = if let Some(hwnd) = vars(|v| v.hwnd.get()) {
+            hwnd
         } else {
             let hinstance = match GetModuleHandleW(None) {
                 Ok(h) => HINSTANCE(h.0),
@@ -1041,47 +1307,32 @@ fn show_panel_with_close_on_mouse_leave(close_on_mouse_leave: bool) {
                 Ok(h) => h,
                 Err(_) => return,
             };
-
-            if let Ok(mut g) = PANEL_HWND.lock() { *g = Some(hwnd.0 as isize); }
+            vars(|v| v.hwnd.set(Some(hwnd)));
             hwnd
         };
 
-        if let Ok(mut g) = PANEL_WIDTH.lock() { *g = width; }
-        if let Ok(mut g) = PANEL_HEIGHT.lock() { *g = height; }
-        if let Ok(mut g) = PANEL_SCROLL_OFFSET.lock() { *g = initial_scroll; }
-        if let Ok(mut g) = PANEL_CAROUSEL_INDEX.lock() { *g = selected_idx as i64; }
-        if let Ok(mut g) = PANEL_SELECTED_INDEX.lock() { *g = Some(selected_idx); }
-        if let Ok(mut g) = PANEL_HOVER_INDEX.lock() { *g = Some(selected_idx); }
-        if let Ok(mut g) = PANEL_DRAGGING.lock() { *g = false; }
-        if let Ok(mut g) = PANEL_SCROLL_TARGET.lock() { *g = None; }
-
-        if image_count > 0 {
-            if let Ok(mut s) = PANEL_THUMB_SCALES.lock() {
-                s.resize(image_count, 1.0);
-                for (i, v) in s.iter_mut().enumerate() {
-                    *v = if i == selected_idx { focus_scale() } else { 1.0 };
-                }
+        vars(|v| {
+            v.width.set(width);
+            v.height.set(height);
+            v.scroll.set(initial_scroll);
+            v.carousel_index.set(selected_idx as i64);
+            v.selected.set(Some(selected_idx));
+            v.hover.set(Some(selected_idx));
+            v.dragging.set(false);
+            v.scroll_target.set(None);
+            if image_count > 0 {
+                let initial = |i: usize| if i == selected_idx { focus_scale() } else { 1.0 };
+                *v.scales.borrow_mut() = (0..image_count).map(initial).collect();
+                *v.targets.borrow_mut() = (0..image_count).map(initial).collect();
             }
-            if let Ok(mut t) = PANEL_THUMB_TARGETS.lock() {
-                t.resize(image_count, 1.0);
-                for (i, v) in t.iter_mut().enumerate() {
-                    *v = if i == selected_idx { focus_scale() } else { 1.0 };
-                }
-            }
-        }
-
-        if let Ok(mut stg) = PANEL_STATE.lock() {
-            *stg = Some(PanelState {
+            v.slide.set(Some(Slide {
                 target_x,
                 start_x,
-                current_x: start_x,
                 target_y,
                 start_y,
-                current_y: start_y,
                 anim_start_time: std::time::Instant::now(),
-                animating: true,
-            });
-        }
+            }));
+        });
         let _ = SetWindowPos(hwnd, HWND_TOPMOST, start_x, start_y, width, height, SWP_NOACTIVATE | SWP_NOZORDER);
         let _ = KillTimer(hwnd, TILE_RELEASE_TIMER_ID);
         // La ventana es layered: sin atributos no se vería. El carrusel entra con fundido.
@@ -1096,95 +1347,84 @@ fn show_panel_with_close_on_mouse_leave(close_on_mouse_leave: bool) {
             HOTKEY_CLICK_CHECK_MS
         };
         let _ = SetTimer(hwnd, AUTO_CLOSE_TIMER_ID, close_check_ms, None);
-        if let Ok(mut v) = PANEL_VISIBLE.lock() { *v = true; }
+        vars(|v| v.visible.set(true));
         crate::log_debug!("Panel: mostrado");
     }
 }
+
 pub fn hide_panel() {
     unsafe {
-        if let Ok(v) = PANEL_VISIBLE.lock() { if !*v { return; } }
-        if let Ok(e) = PANEL_EXITING.lock() { if *e { return; } }
+        if !vars(|v| v.visible.get()) || vars(|v| v.exiting.get()) { return; }
+        let Some(hwnd) = vars(|v| v.hwnd.get()) else { return; };
+        let _ = KillTimer(hwnd, AUTO_CLOSE_TIMER_ID);
+        let _ = KillTimer(hwnd, HOVER_ANIM_TIMER_ID);
+        vars(|v| {
+            v.animating.set(false);
+            v.buttons.set(None);
+            v.hot_button.set(None);
+        });
 
-        if let Some(hwnd_val) = PANEL_HWND.lock().ok().and_then(|g| *g) {
-            let hwnd = HWND(hwnd_val as *mut _);
-            let _ = KillTimer(hwnd, AUTO_CLOSE_TIMER_ID);
-            let _ = KillTimer(hwnd, HOVER_ANIM_TIMER_ID);
+        let mut wr = RECT::default();
+        let _ = GetWindowRect(hwnd, &mut wr);
+        let side = vars(|v| v.side.get());
+        let (start_x, start_y) = (wr.left, wr.top);
+        let (width, height) = vars(|v| (v.width.get(), v.height.get()));
+        let monitor = panel_monitor_rect(hwnd);
+        let (target_x, target_y) = match side {
+            _ if is_carousel() => (start_x, start_y + CAROUSEL_SLIDE_PX),
+            PanelSide::Top => (start_x, monitor.top - height),
+            PanelSide::Left => (monitor.left - width, start_y),
+            PanelSide::Right => (monitor.right, start_y),
+        };
 
-            let mut wr = RECT::default();
-            let _ = windows::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut wr);
-            let side = PANEL_SIDE.lock().map(|value| *value).unwrap_or(PanelSide::Top);
-            let start_x = wr.left;
-            let start_y = wr.top;
-            let height = if let Ok(g) = PANEL_HEIGHT.lock() { *g } else { thumb_h() + thumb_margin() * 2 + scrollbar_size() };
-            let width = if let Ok(g) = PANEL_WIDTH.lock() { *g } else { thumb_w() + thumb_margin() * 2 + scrollbar_size() };
-            let hmon = windows::Win32::Graphics::Gdi::MonitorFromWindow(hwnd, windows::Win32::Graphics::Gdi::MONITOR_DEFAULTTONEAREST);
-            let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
-            let _ = windows::Win32::Graphics::Gdi::GetMonitorInfoW(hmon, &mut mi);
-            let (target_x, target_y) = match side {
-                _ if is_carousel() => (start_x, start_y + CAROUSEL_SLIDE_PX),
-                PanelSide::Top => (start_x, mi.rcMonitor.top - height),
-                PanelSide::Left => (mi.rcMonitor.left - width, start_y),
-                PanelSide::Right => (mi.rcMonitor.right, start_y),
-            };
-
-            if let Ok(mut stg) = PANEL_STATE.lock() {
-                *stg = Some(PanelState {
-                    target_x,
-                    start_x,
-                    current_x: start_x,
-                    target_y,
-                    start_y,
-                    current_y: start_y,
-                    anim_start_time: std::time::Instant::now(),
-                    animating: true,
-                });
-            }
-            if let Ok(mut e) = PANEL_EXITING.lock() { *e = true; }
-            let _ = SetTimer(hwnd, ANIM_TIMER_ID, ANIM_STEP_MS, None);
-            crate::log_debug!("Panel: animando salida");
-        }
+        vars(|v| {
+            v.slide.set(Some(Slide {
+                target_x,
+                start_x,
+                target_y,
+                start_y,
+                anim_start_time: std::time::Instant::now(),
+            }));
+            v.exiting.set(true);
+        });
+        let _ = SetTimer(hwnd, ANIM_TIMER_ID, ANIM_STEP_MS, None);
+        crate::log_debug!("Panel: animando salida");
     }
 }
 
 pub fn set_draw_context(cache: ThumbnailCache, images: Arc<Mutex<Vec<ScannedImage>>>) {
     // Inicializar escalas por miniatura
-    if let Ok(imgs) = images.lock() {
-        let n = imgs.len();
-        if let Ok(mut s) = PANEL_THUMB_SCALES.lock() {
-            s.resize(n, 1.0);
-            for v in s.iter_mut() { if *v == 0.0 { *v = 1.0; } }
-        }
-        if let Ok(mut t) = PANEL_THUMB_TARGETS.lock() {
-            t.resize(n, 1.0);
-            for v in t.iter_mut() { *v = 1.0; }
-        }
-    }
-    if let Ok(mut g) = PANEL_THUMB_CACHE.lock() { *g = Some(cache); }
-    if let Ok(mut g) = PANEL_SCANNED.lock() { *g = Some(images); }
+    let n = images.lock().map(|imgs| imgs.len()).unwrap_or(0);
+    vars(|v| {
+        v.scales.borrow_mut().resize(n, 1.0);
+        let mut targets = v.targets.borrow_mut();
+        targets.clear();
+        targets.resize(n, 1.0);
+        *v.thumb_cache.borrow_mut() = Some(cache);
+        *v.scanned.borrow_mut() = Some(images);
+    });
     request_repaint();
 }
 
-pub fn set_current_wallpaper(path: &std::path::Path) {
-    if let Ok(mut g) = PANEL_CURRENT_WALLPAPER.lock() {
-        *g = Some(path.to_path_buf());
-    }
+pub fn set_current_wallpaper(path: &Path) {
+    vars(|v| *v.current_wallpaper.borrow_mut() = Some(path.to_path_buf()));
     request_repaint();
 }
 
 pub fn request_repaint() {
-    if let Some(hwnd_val) = PANEL_HWND.lock().ok().and_then(|g| *g) {
+    if let Some(hwnd) = vars(|v| v.hwnd.get()) {
         unsafe {
-            let _ = windows::Win32::Graphics::Gdi::InvalidateRect(HWND(hwnd_val as *mut _), None, true);
+            let _ = windows::Win32::Graphics::Gdi::InvalidateRect(hwnd, None, true);
         }
     }
 }
 
 pub fn is_panel_visible() -> bool {
-    PANEL_VISIBLE.lock().map(|v| *v).unwrap_or(false)
+    vars(|v| v.visible.get())
 }
 
 #[cfg(test)]
-pub(crate) unsafe fn save_bmp(dc: windows::Win32::Graphics::Gdi::HDC, bmp: windows::Win32::Graphics::Gdi::HBITMAP, width: i32, height: i32, path: &str) {
+pub(crate) unsafe fn save_bmp(dc: HDC, bmp: windows::Win32::Graphics::Gdi::HBITMAP, width: i32, height: i32, path: &str) {
     use windows::Win32::Graphics::Gdi::{GetDIBits, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS};
     let mut info = BITMAPINFO {
         bmiHeader: BITMAPINFOHEADER {
@@ -1260,8 +1500,8 @@ mod tests {
     fn render_strip_preview() {
         let dir = std::env::var("SWEPR_TEST_DIR").expect("SWEPR_TEST_DIR");
         let out = std::env::var("SWEPR_TEST_OUT").expect("SWEPR_TEST_OUT");
-        let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(dir).unwrap().flatten().map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|e| ["jpg", "jpeg", "png"].contains(&e.to_string_lossy().to_lowercase().as_str())))
+        let mut paths: Vec<PathBuf> = std::fs::read_dir(dir).unwrap().flatten().map(|e| e.path())
+            .filter(|p| crate::scanner::is_supported_image(p))
             .collect();
         paths.sort();
         paths.truncate(10);
@@ -1269,6 +1509,8 @@ mod tests {
             path: p.clone(),
             file_name: String::new(),
             is_new: i == 4 || i == 6,
+            is_favorite: i == 3,
+            modified: None,
         }).collect();
         let cache = ThumbnailCache::new();
         unsafe {
@@ -1281,24 +1523,28 @@ mod tests {
         while cache.len() < images.len() && started.elapsed().as_secs() < 10 {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        PANEL_DPI.store(144, std::sync::atomic::Ordering::Relaxed);
-        *PANEL_SIDE.lock().unwrap() = PanelSide::Top;
-        *PANEL_MODE.lock().unwrap() = PanelMode::LowPower;
-        *PANEL_SHOW_SCROLLBAR.lock().unwrap() = true;
-        *PANEL_CURRENT_WALLPAPER.lock().unwrap() = Some(images[2].path.clone());
-        *PANEL_SELECTED_INDEX.lock().unwrap() = Some(2);
-        *PANEL_HOVER_INDEX.lock().unwrap() = Some(5);
-        *PANEL_THUMB_SCALES.lock().unwrap() = (0..images.len()).map(|i| if i == 5 { 0.9 } else { 1.0 }).collect();
         let width = 1600;
+        vars(|v| {
+            v.dpi.set(144);
+            v.side.set(PanelSide::Top);
+            v.mode.set(PanelMode::LowPower);
+            v.show_scrollbar.set(true);
+            *v.current_wallpaper.borrow_mut() = Some(images[2].path.clone());
+            v.selected.set(Some(2));
+            v.hover.set(Some(5));
+            *v.scales.borrow_mut() = (0..images.len()).map(|i| if i == 5 { 0.9 } else { 1.0 }).collect();
+        });
         let height = thumb_h() + thumb_margin() * 2 + scrollbar_size();
-        *PANEL_WIDTH.lock().unwrap() = width;
-        *PANEL_HEIGHT.lock().unwrap() = height;
-        *PANEL_SCROLL_OFFSET.lock().unwrap() = 0;
-        *PANEL_THUMB_CACHE.lock().unwrap() = Some(cache);
-        *PANEL_SCANNED.lock().unwrap() = Some(Arc::new(Mutex::new(images)));
+        vars(|v| {
+            v.width.set(width);
+            v.height.set(height);
+            v.scroll.set(0);
+            *v.thumb_cache.borrow_mut() = Some(cache);
+            *v.scanned.borrow_mut() = Some(Arc::new(Mutex::new(images)));
+        });
         unsafe {
             render(width, height, &format!("{out}-strip.bmp"));
-            *PANEL_SCANNED.lock().unwrap() = Some(Arc::new(Mutex::new(Vec::new())));
+            vars(|v| *v.scanned.borrow_mut() = Some(Arc::new(Mutex::new(Vec::new()))));
             render(width, height, &format!("{out}-empty.bmp"));
         }
     }

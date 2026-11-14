@@ -7,7 +7,7 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, DestroyMenu, PostMessageW, SetForegroundWindow,
     TrackPopupMenu, MF_CHECKED, MF_SEPARATOR, MF_STRING, MF_UNCHECKED,
-    TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_NULL,
+    TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_NULL, MF_GRAYED,
 };
 use crate::{log_info, log_warn};
 use crate::winutil::{as_pcwstr, get_cursor_position, to_wide_chars};
@@ -18,6 +18,9 @@ pub const IDM_TOGGLE_DETECTION: usize = 1002;
 pub const IDM_REFRESH_GALLERY: usize = 1003;
 pub const IDM_OPEN_FOLDER: usize = 1004;
 pub const IDM_SETTINGS: usize = 1005;
+pub const IDM_NEXT_WALLPAPER: usize = 1006;
+pub const IDM_RANDOM_WALLPAPER: usize = 1007;
+pub const IDM_UNDO_WALLPAPER: usize = 1009;
 pub const IDM_EXIT: usize = 1008;
 
 fn tr(key: &str) -> Vec<u16> { to_wide_chars(&crate::i18n::t(key)) }
@@ -71,7 +74,8 @@ impl TrayIcon {
         nid.hIcon = crate::resources::app_icon();
 
         let tip_chars = tr("SWEPR - Wallpaper Selector");
-        let copy_len = tip_chars.len().min(nid.szTip.len());
+        // Dejar siempre sitio para el nulo final.
+        let copy_len = tip_chars.len().min(nid.szTip.len() - 1);
         nid.szTip[..copy_len].copy_from_slice(&tip_chars[..copy_len]);
 
         unsafe {
@@ -125,7 +129,7 @@ impl TrayIcon {
     }
 
     /// Despliega el menú contextual Win32 nativo en la posición actual del cursor.
-    pub fn show_context_menu(&self, detection_enabled: bool) -> Option<usize> {
+    pub fn show_context_menu(&self, detection_enabled: bool, can_undo: bool) -> Option<usize> {
         unsafe {
             let hmenu = match CreatePopupMenu() {
                 Ok(menu) => menu,
@@ -135,6 +139,9 @@ impl TrayIcon {
                 }
             };
 
+            let title_next = tr("Next wallpaper");
+            let title_random = tr("Random wallpaper");
+            let title_undo = tr("Back to previous wallpaper");
             let title_detect = tr("Detection enabled");
             let title_refresh = tr("Refresh gallery");
             let title_folder = tr("Open folder");
@@ -146,6 +153,11 @@ impl TrayIcon {
             } else {
                 MF_STRING | MF_UNCHECKED
             };
+            let undo_flags = if can_undo { MF_STRING } else { MF_STRING | MF_GRAYED };
+            let _ = AppendMenuW(hmenu, MF_STRING, IDM_NEXT_WALLPAPER, as_pcwstr(&title_next));
+            let _ = AppendMenuW(hmenu, MF_STRING, IDM_RANDOM_WALLPAPER, as_pcwstr(&title_random));
+            let _ = AppendMenuW(hmenu, undo_flags, IDM_UNDO_WALLPAPER, as_pcwstr(&title_undo));
+            let _ = AppendMenuW(hmenu, MF_SEPARATOR, 0, PCWSTR::null());
             let _ = AppendMenuW(hmenu, det_flags, IDM_TOGGLE_DETECTION, as_pcwstr(&title_detect));
             let _ = AppendMenuW(hmenu, MF_STRING, IDM_REFRESH_GALLERY, as_pcwstr(&title_refresh));
             let _ = AppendMenuW(hmenu, MF_STRING, IDM_OPEN_FOLDER, as_pcwstr(&title_folder));

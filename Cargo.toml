@@ -1,6 +1,6 @@
 [package]
 name = "swepr"
-version = "0.1.0"
+version = "1.2.1"
 edition = "2021"
 license = "GPL-3.0-only"
 
@@ -38,6 +38,17 @@ features = [
     "Win32_Graphics_Gdi",
     "Win32_Graphics_Dwm",
     "Win32_UI_HiDpi",
+    # Lienzo SWEPR: dibujo con Direct2D e imágenes con WIC.
+    "Win32_Graphics_Direct2D",
+    "Win32_Graphics_Direct2D_Common",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Imaging",
+    "Foundation_Numerics",
+    # Fondo de la pantalla de bloqueo (WinRT).
+    "Foundation",
+    "Storage",
+    "System_UserProfile",
 ]
 
 # Solo para las pruebas que dibujan la ventana de configuración en un BMP.

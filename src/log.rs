@@ -8,6 +8,7 @@ use windows::Win32::System::Threading::{GetCurrentProcess, GetGuiResources, GR_G
 use crate::{log_error, log_info};
 
 static LOG_FILE: Mutex<Option<File>> = Mutex::new(None);
+const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
 
 /// Inicializa el sistema de logs escribiendo en %LOCALAPPDATA%\swepr\log.txt.
 /// Si el directorio no existe, lo crea.
@@ -20,10 +21,13 @@ pub fn init() -> Result<PathBuf, String> {
         .map_err(|e| format!("Error al crear directorio de logs {:?}: {e}", dir))?;
 
     let log_path = dir.join("log.txt");
-    // Rotacion simple: si el log supera 5 MB, se trunca para evitar crecimiento indefinido
+    // Rotación: si el log supera 5 MB pasa a log.old.txt (se conserva la sesión anterior).
     if let Ok(meta) = std::fs::metadata(&log_path) {
-        if meta.len() > 5 * 1024 * 1024 {
-            let _ = File::create(&log_path);
+        if meta.len() > MAX_LOG_BYTES {
+            let old_path = dir.join("log.old.txt");
+            if std::fs::rename(&log_path, &old_path).is_err() {
+                let _ = File::create(&log_path);
+            }
         }
     }
     let file = OpenOptions::new()

@@ -44,41 +44,85 @@ pub enum WallpaperStyle {
     Stretch,
     Fit,
     Fill,
+    Span,
+}
+
+impl From<crate::config::FitMode> for WallpaperStyle {
+    fn from(mode: crate::config::FitMode) -> Self {
+        use crate::config::FitMode;
+        match mode {
+            FitMode::Center => WallpaperStyle::Center,
+            FitMode::Tile => WallpaperStyle::Tile,
+            FitMode::Stretch => WallpaperStyle::Stretch,
+            FitMode::Fit => WallpaperStyle::Fit,
+            FitMode::Fill => WallpaperStyle::Fill,
+            FitMode::Span => WallpaperStyle::Span,
+        }
+    }
 }
 
 impl WallpaperStyle {
-    pub fn from_str(s: &str) -> Self {
-        match s.to_ascii_lowercase().as_str() {
-            "center" => WallpaperStyle::Center,
-            "tile" => WallpaperStyle::Tile,
-            "stretch" => WallpaperStyle::Stretch,
-            "fit" => WallpaperStyle::Fit,
-            _ => WallpaperStyle::Fill,
-        }
-    }
-    
     fn to_dw_style(self) -> i32 {
-        // DESKTOP_WALLPAPER_POSITION: Center=0, Tile=1, Stretch=2, Fit=3, Fill=4
+        // DESKTOP_WALLPAPER_POSITION: Center=0, Tile=1, Stretch=2, Fit=3, Fill=4, Span=5
         match self {
             WallpaperStyle::Center => 0,
             WallpaperStyle::Tile => 1,
             WallpaperStyle::Stretch => 2,
             WallpaperStyle::Fit => 3,
             WallpaperStyle::Fill => 4,
+            WallpaperStyle::Span => 5,
         }
     }
 
     /// Equivalente WPSTYLE_* de IActiveDesktop.
     fn to_wp_style(self) -> u32 {
-        // WPSTYLE: Center=0, Tile=1, Stretch=2, KeepAspect=3, CropToFit=4
+        // WPSTYLE: Center=0, Tile=1, Stretch=2, KeepAspect=3, CropToFit=4, Span=5
         match self {
             WallpaperStyle::Center => 0,
             WallpaperStyle::Tile => 1,
             WallpaperStyle::Stretch => 2,
             WallpaperStyle::Fit => 3,
             WallpaperStyle::Fill => 4,
+            WallpaperStyle::Span => 5,
         }
     }
+}
+
+/// Convierte una cadena devuelta por COM (reservada con CoTaskMemAlloc) y la libera.
+unsafe fn take_com_string(value: windows::core::PWSTR) -> Result<String, String> {
+    if value.is_null() {
+        return Err("cadena vacía".into());
+    }
+    let text = value.to_string().map_err(|e| e.to_string());
+    windows::Win32::System::Com::CoTaskMemFree(Some(value.0 as *const _));
+    text
+}
+
+/// Pone una imagen como fondo de la pantalla de bloqueo (en un hilo aparte: la API es asíncrona).
+pub fn set_lock_screen(path: &Path) {
+    let path = path.to_path_buf();
+    std::thread::spawn(move || unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let result = (|| -> windows::core::Result<()> {
+            let file = windows::Storage::StorageFile::GetFileFromPathAsync(&windows::core::HSTRING::from(path.as_os_str()))?.get()?;
+            windows::System::UserProfile::LockScreen::SetImageFileAsync(&windows::core::Interface::cast::<windows::Storage::IStorageFile>(&file)?)?.get()
+        })();
+        match result {
+            Ok(()) => log_info!("Pantalla de bloqueo cambiada a {:?}", path),
+            Err(e) => {
+                crate::log_error!("No se pudo cambiar la pantalla de bloqueo: {e}");
+                let text = crate::winutil::to_wide_chars(&format!("{}\n\n{e}", crate::i18n::t("Could not change the lock screen image.")));
+                let title = crate::winutil::to_wide_chars("SWEPR");
+                let _ = windows::Win32::UI::WindowsAndMessaging::MessageBoxW(
+                    None,
+                    crate::winutil::as_pcwstr(&text),
+                    crate::winutil::as_pcwstr(&title),
+                    windows::Win32::UI::WindowsAndMessaging::MB_ICONWARNING | windows::Win32::UI::WindowsAndMessaging::MB_SETFOREGROUND,
+                );
+            }
+        }
+        CoUninitialize();
+    });
 }
 
 /// Hilo STA que aplica fondos con fundido. Si llegan varios seguidos (atajos repetidos),
@@ -111,6 +155,63 @@ fn fade_worker() -> Option<Sender<(PathBuf, WallpaperStyle)>> {
         *guard = Some(sender);
     }
     guard.clone()
+}
+
+/// Petición de sincronización: imagen, monitor (None = todos), estilo y desde cuándo aplicarla.
+type SyncRequest = (PathBuf, Option<String>, WallpaperStyle, std::time::Instant);
+
+/// Hilo que aplica el fondo real de Windows sin animación mientras el lienzo lo tapa.
+static SYNC_WORKER: Mutex<Option<Sender<SyncRequest>>> = Mutex::new(None);
+
+/// Pone `path` como fondo real de Windows en segundo plano (sin fundido), pasado `delay`. Lo usa
+/// el lienzo para que la vista de tareas, el color de énfasis y otras apps vean la misma imagen,
+/// y para que el escritorio quede bien si SWEPR se cierra. Se espera a que acabe la transición:
+/// al cambiar el fondo, el Explorador recrea su capa y podría tapar el efecto a medias.
+pub fn sync_in_background(path: &Path, monitor_id: Option<String>, style: WallpaperStyle, delay: std::time::Duration) {
+    let Ok(mut guard) = SYNC_WORKER.lock() else { return; };
+    if guard.is_none() {
+        let (sender, receiver) = channel::<SyncRequest>();
+        std::thread::spawn(move || unsafe {
+            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+            let Ok(wallpaper) = CoCreateInstance::<_, IDesktopWallpaper>(&DesktopWallpaper, None, CLSCTX_ALL) else {
+                crate::log_error!("Sincronización del fondo: IDesktopWallpaper no disponible.");
+                return;
+            };
+            while let Ok(first) = receiver.recv() {
+                // Solo la última petición de cada monitor (una para "todos" anula las demás),
+                // esperando a que pase el plazo de la más reciente.
+                let mut deadline = first.3;
+                let mut pending: Vec<SyncRequest> = vec![first];
+                loop {
+                    let wait = deadline.saturating_duration_since(std::time::Instant::now());
+                    match receiver.recv_timeout(wait) {
+                        Ok(request) => {
+                            deadline = deadline.max(request.3);
+                            if request.1.is_none() {
+                                pending.clear();
+                            } else {
+                                pending.retain(|p| p.1 != request.1);
+                            }
+                            pending.push(request);
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                    }
+                }
+                for (path, monitor, style, _) in pending {
+                    if let Err(e) = apply_instant(&wallpaper, &path, monitor.as_deref(), style) {
+                        crate::log_error!("Sincronización del fondo fallida: {e}");
+                    }
+                }
+                // Cambiar el fondo puede reordenar las capas del escritorio.
+                crate::canvas::restack();
+            }
+        });
+        *guard = Some(sender);
+    }
+    if let Some(sender) = guard.as_ref() {
+        let _ = sender.send((path.to_path_buf(), monitor_id, style, std::time::Instant::now() + delay));
+    }
 }
 
 /// Aplica el fondo a todos los monitores con el fundido nativo de Windows.
@@ -154,7 +255,8 @@ unsafe fn apply_instant(wallpaper: &IDesktopWallpaper, path: &Path, monitor_id: 
     Ok(())
 }
 
-#[derive(Clone)]
+/// Envoltorio de IDesktopWallpaper. No es `Clone` a propósito: cada instancia equilibra
+/// su propio CoInitializeEx con un CoUninitialize al destruirse.
 pub struct WallpaperManager {
     wallpaper: Option<IDesktopWallpaper>,
     com_initialized: bool,
@@ -200,9 +302,63 @@ impl WallpaperManager {
             let path_pwstr = wallpaper
                 .GetWallpaper(PCWSTR(std::ptr::null()))
                 .map_err(|e| format!("GetWallpaper fallo: {e}"))?;
-            let path_str = path_pwstr.to_string().map_err(|e| format!("{e}"))?;
+            let path_str = take_com_string(path_pwstr)?;
+            if path_str.is_empty() {
+                return Err("Sin fondo de pantalla común a todos los monitores".into());
+            }
             Ok(std::path::PathBuf::from(path_str))
         }
+    }
+
+    /// Monitores conectados (identificador y rectángulo), de izquierda a derecha.
+    pub fn monitors(&self) -> Vec<(String, windows::Win32::Foundation::RECT)> {
+        let Some(wallpaper) = self.wallpaper.as_ref() else { return Vec::new(); };
+        let mut monitors: Vec<(i32, i32, String, windows::Win32::Foundation::RECT)> = Vec::new();
+        unsafe {
+            let count = wallpaper.GetMonitorDevicePathCount().unwrap_or(0);
+            for index in 0..count {
+                let Ok(raw) = wallpaper.GetMonitorDevicePathAt(index) else { continue; };
+                let Ok(id) = take_com_string(raw) else { continue; };
+                let wide: Vec<u16> = id.encode_utf16().chain(std::iter::once(0)).collect();
+                // Los monitores desconectados siguen en la lista pero no tienen rectángulo.
+                if let Ok(rect) = wallpaper.GetMonitorRECT(PCWSTR(wide.as_ptr())) {
+                    if rect.right > rect.left {
+                        monitors.push((rect.left, rect.top, id, rect));
+                    }
+                }
+            }
+        }
+        monitors.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+        monitors.into_iter().map(|(_, _, id, rect)| (id, rect)).collect()
+    }
+
+    /// Fondo que Windows tiene puesto en un monitor concreto.
+    pub fn wallpaper_of(&self, monitor_id: &str) -> Option<PathBuf> {
+        let wallpaper = self.wallpaper.as_ref()?;
+        let wide: Vec<u16> = monitor_id.encode_utf16().chain(std::iter::once(0)).collect();
+        unsafe {
+            let raw = wallpaper.GetWallpaper(PCWSTR(wide.as_ptr())).ok()?;
+            take_com_string(raw).ok().filter(|path| !path.is_empty()).map(PathBuf::from)
+        }
+    }
+
+    /// Identificador del monitor cuyo rectángulo coincide con `rect` (el del monitor del panel).
+    pub fn monitor_id_for_rect(&self, rect: windows::Win32::Foundation::RECT) -> Option<String> {
+        let wallpaper = self.wallpaper.as_ref()?;
+        unsafe {
+            let count = wallpaper.GetMonitorDevicePathCount().ok()?;
+            for index in 0..count {
+                let Ok(raw) = wallpaper.GetMonitorDevicePathAt(index) else { continue; };
+                let Ok(id) = take_com_string(raw) else { continue; };
+                let wide: Vec<u16> = id.encode_utf16().chain(std::iter::once(0)).collect();
+                if let Ok(monitor_rect) = wallpaper.GetMonitorRECT(PCWSTR(wide.as_ptr())) {
+                    if monitor_rect == rect {
+                        return Some(id);
+                    }
+                }
+            }
+        }
+        None
     }
 }
 

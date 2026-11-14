@@ -24,7 +24,8 @@ pub enum ZoneType {
     BottomRight,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ZoneConfig {
     pub enabled: bool,
     pub delay_ms: u32,

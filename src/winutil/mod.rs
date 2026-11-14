@@ -131,10 +131,7 @@ pub fn is_any_mouse_button_down() -> bool {
 pub fn is_notification_allowed() -> bool {
     unsafe {
         match SHQueryUserNotificationState() {
-            Ok(state) => match state {
-                QUNS_RUNNING_D3D_FULL_SCREEN | QUNS_PRESENTATION_MODE | QUNS_BUSY => false,
-                _ => true,
-            },
+            Ok(state) => !matches!(state, QUNS_RUNNING_D3D_FULL_SCREEN | QUNS_PRESENTATION_MODE | QUNS_BUSY),
             Err(_) => true,
         }
     }
@@ -190,5 +187,52 @@ impl Drop for SingleInstance {
                 let _ = CloseHandle(self.handle);
             }
         }
+    }
+}
+
+/// Compara rutas como lo hace Windows: sin distinguir mayúsculas y con cualquier separador.
+pub fn same_path(a: &Path, b: &Path) -> bool {
+    let normalize = |path: &Path| path.to_string_lossy().replace('/', "\\").trim_end_matches('\\').to_lowercase();
+    normalize(a) == normalize(b)
+}
+
+/// Número pseudoaleatorio en `0..bound` (xorshift sembrado con la hora; basta para el modo aleatorio).
+pub fn random_below(bound: usize) -> usize {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static STATE: AtomicU64 = AtomicU64::new(0);
+    if bound <= 1 { return 0; }
+    let mut x = STATE.load(Ordering::Relaxed);
+    if x == 0 {
+        x = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0x9E37_79B9_7F4A_7C15)
+            | 1;
+    }
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    STATE.store(x, Ordering::Relaxed);
+    (x % bound as u64) as usize
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn same_path_ignores_case_and_separators() {
+        assert!(same_path(Path::new(r"C:\Fotos\A.jpg"), Path::new("c:/fotos/a.JPG")));
+        assert!(same_path(Path::new(r"C:\Fotos\"), Path::new(r"C:\fotos")));
+        assert!(!same_path(Path::new(r"C:\Fotos\a.jpg"), Path::new(r"C:\Fotos\b.jpg")));
+    }
+
+    #[test]
+    fn random_below_stays_in_range() {
+        for _ in 0..1000 {
+            assert!(random_below(7) < 7);
+        }
+        assert_eq!(random_below(1), 0);
+        assert_eq!(random_below(0), 0);
     }
 }

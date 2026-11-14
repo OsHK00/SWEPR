@@ -25,9 +25,8 @@ fn language_directories() -> Vec<PathBuf> {
             }
         }
     }
-    if let Ok(cwd) = std::env::current_dir() {
-        directories.push(cwd.join("languages"));
-    }
+    // Solo junto al ejecutable (y sus carpetas superiores, para `cargo run`): el directorio de
+    // trabajo depende de cómo se lanzó SWEPR y podría cargar traducciones ajenas.
     directories
 }
 
@@ -78,7 +77,8 @@ pub fn t(key: &str) -> String {
     let language = ACTIVE_LANGUAGE.lock().ok().and_then(|value| value.clone()).unwrap_or_else(|| "auto".into());
     if let Ok(mut cache) = TRANSLATIONS.lock() {
         if cache.as_ref().map(|(cached_language, _)| cached_language != &language).unwrap_or(true) {
-            *cache = Some((language.clone(), load_translations(&language)));
+            let translations = load_translations(&language);
+            *cache = Some((language, translations));
         }
         if let Some((_, translations)) = cache.as_ref() {
             return translations.get(key).cloned().unwrap_or_else(|| key.to_string());

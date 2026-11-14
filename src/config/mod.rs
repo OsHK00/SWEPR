@@ -1,44 +1,101 @@
 pub mod autostart;
+mod hidden;
 mod hotkey_field;
 mod theme;
 pub mod window;
 
-use std::fs::{create_dir_all, File};
-use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::fs::create_dir_all;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use crate::detector::zones::{ZoneConfig, ZoneType};
-use crate::log_info;
+use crate::{log_error, log_info};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Configuración de SWEPR. Los campos que falten en el JSON toman el valor por defecto.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AppConfig {
     pub wallpaper_dir: PathBuf,
     pub detection_enabled: bool,
     pub autostart: bool,
     pub scan_subfolders: bool,
-    pub sort_by: String, // "Name" | "Date"
-    pub fit_mode: String, // "Fill" | "Fit" | "Stretch" | "Center" | "Tile"
+    pub sort_by: SortOrder,
+    pub fit_mode: FitMode,
     pub thumb_size: u32, // Tamaño en px de las miniaturas generadas (64..512, recomendado 128)
     pub zones: ZoneConfig,
-    #[serde(default)]
     pub panel_side: PanelSide,
-    #[serde(default)]
     pub panel_mode: PanelMode,
-    #[serde(default)]
     pub pro_priority: ProPriority,
-    #[serde(default)]
     pub thumb_loading: ThumbLoading,
     /// Cambiar el fondo con el fundido nativo de Windows.
-    #[serde(default = "default_wallpaper_fade")]
     pub wallpaper_fade: bool,
-    #[serde(default = "default_show_scrollbar")]
     pub show_scrollbar: bool,
-    #[serde(default = "default_panel_margin")]
     pub panel_margin: u32,
-    #[serde(default = "default_language")]
     pub language: String,
-    #[serde(default)]
     pub hotkeys: HotkeyConfig,
+    /// Cambio automático de fondo cada N minutos (0 = desactivado).
+    pub rotation_minutes: u32,
+    /// "Siguiente" (atajo, bandeja y rotación) elige una imagen al azar.
+    pub shuffle: bool,
+    /// La rotación automática solo usa las imágenes favoritas (si hay alguna).
+    pub rotation_favorites_only: bool,
+    /// Imágenes marcadas como favoritas desde el panel.
+    pub favorites: Vec<PathBuf>,
+    /// Imágenes quitadas de la galería (el archivo no se borra; se pueden restaurar en Configuración).
+    pub excluded: Vec<PathBuf>,
+    /// Con varios monitores, "siguiente", aleatorio y la rotación ponen una imagen distinta en cada uno,
+    /// y al elegir en el panel se cambia solo el monitor donde está el panel.
+    pub per_monitor: bool,
+    /// Cómo se cambia el fondo: con Windows o con el lienzo de SWEPR.
+    pub apply_mode: ApplyMode,
+    /// Duración de la transición del lienzo, en milisegundos.
+    pub transition_ms: u32,
+    /// Efecto de la transición del lienzo.
+    pub transition: Transition,
+}
+
+/// Efecto con el que el lienzo pasa de un fondo al siguiente.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Transition {
+    /// Fundido cruzado.
+    #[default]
+    Fade,
+    /// La imagen nueva entra desde la derecha empujando a la anterior.
+    Slide,
+    /// La imagen nueva aparece acercándose suavemente.
+    Zoom,
+    /// Barrido de izquierda a derecha.
+    Wipe,
+    /// Círculo que se abre desde el centro.
+    Circle,
+    /// Uno distinto cada vez.
+    Random,
+}
+
+impl Transition {
+    pub const ALL: [Transition; 6] = [Transition::Fade, Transition::Slide, Transition::Zoom, Transition::Wipe, Transition::Circle, Transition::Random];
+    /// Efectos concretos (sin "aleatorio").
+    pub const EFFECTS: [Transition; 5] = [Transition::Fade, Transition::Slide, Transition::Zoom, Transition::Wipe, Transition::Circle];
+
+    /// El efecto que se usará ahora: "aleatorio" elige uno de los demás.
+    pub fn resolve(self, random: impl FnOnce(usize) -> usize) -> Transition {
+        match self {
+            Transition::Random => Self::EFFECTS[random(Self::EFFECTS.len()) % Self::EFFECTS.len()],
+            other => other,
+        }
+    }
+}
+
+/// Forma de aplicar los fondos.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ApplyMode {
+    /// Windows cambia el fondo (con o sin su fundido, según `wallpaper_fade`).
+    #[default]
+    Windows,
+    /// SWEPR lo dibuja detrás de los iconos, al instante y con transición propia.
+    Canvas,
 }
 
 fn default_show_scrollbar() -> bool { true }
@@ -46,16 +103,49 @@ fn default_wallpaper_fade() -> bool { true }
 fn default_panel_margin() -> u32 { 16 }
 fn default_language() -> String { "auto".to_string() }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Orden de la galería.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SortOrder {
+    #[default]
+    #[serde(alias = "Name", alias = "NAME")]
+    Name,
+    /// Más recientes primero.
+    #[serde(alias = "Date", alias = "DATE")]
+    Date,
+}
+
+/// Cómo se ajusta la imagen a la pantalla.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum FitMode {
+    #[default]
+    #[serde(alias = "Fill")]
+    Fill,
+    #[serde(alias = "Fit")]
+    Fit,
+    #[serde(alias = "Stretch")]
+    Stretch,
+    #[serde(alias = "Center")]
+    Center,
+    #[serde(alias = "Tile")]
+    Tile,
+    /// Una sola imagen extendida sobre todos los monitores.
+    #[serde(alias = "Span")]
+    Span,
+}
+
+impl FitMode {
+    pub const ALL: [FitMode; 6] = [FitMode::Fill, FitMode::Fit, FitMode::Stretch, FitMode::Center, FitMode::Tile, FitMode::Span];
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum PanelSide {
+    #[default]
     Top,
     Left,
     Right,
-}
-
-impl Default for PanelSide {
-    fn default() -> Self { Self::Top }
 }
 
 /// Estilo del panel de miniaturas.
@@ -101,7 +191,7 @@ impl PanelSide {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HotkeyConfig {
     #[serde(default = "default_open_panel_hotkey")]
     pub open_panel: HotkeyBinding,
@@ -111,7 +201,7 @@ pub struct HotkeyConfig {
     pub next_wallpaper: HotkeyBinding,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HotkeyBinding {
     pub modifiers: Vec<String>,
     pub key: String,
@@ -271,8 +361,8 @@ impl Default for AppConfig {
             detection_enabled: true,
             autostart: false,
             scan_subfolders: true,
-            sort_by: "Name".to_string(),
-            fit_mode: "Fill".to_string(),
+            sort_by: SortOrder::Name,
+            fit_mode: FitMode::Fill,
             thumb_size: 128,
             zones: ZoneConfig::default(),
             panel_side: PanelSide::Top,
@@ -280,12 +370,41 @@ impl Default for AppConfig {
             pro_priority: ProPriority::Performance,
             thumb_loading: ThumbLoading::Preload,
             wallpaper_fade: default_wallpaper_fade(),
-            show_scrollbar: true,
+            show_scrollbar: default_show_scrollbar(),
             panel_margin: default_panel_margin(),
             language: default_language(),
             hotkeys: HotkeyConfig::default(),
+            rotation_minutes: 0,
+            shuffle: false,
+            rotation_favorites_only: false,
+            favorites: Vec::new(),
+            excluded: Vec::new(),
+            per_monitor: false,
+            apply_mode: ApplyMode::Windows,
+            transition_ms: 600,
+            transition: Transition::Fade,
         }
     }
+}
+
+/// Escribe un archivo de forma atómica: primero a `<archivo>.tmp` y luego lo renombra,
+/// así un corte a mitad de escritura nunca deja el archivo original vacío o a medias.
+pub fn write_atomically(path: &Path, contents: &[u8]) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        let _ = create_dir_all(parent);
+    }
+    let mut temp_name = path.file_name().map(|name| name.to_os_string()).unwrap_or_default();
+    temp_name.push(".tmp");
+    let temp_path = path.with_file_name(temp_name);
+    {
+        let mut file = std::fs::File::create(&temp_path).map_err(|e| format!("Error al crear {:?}: {e}", temp_path))?;
+        file.write_all(contents).map_err(|e| format!("Error al escribir {:?}: {e}", temp_path))?;
+        file.sync_all().map_err(|e| format!("Error al volcar {:?}: {e}", temp_path))?;
+    }
+    std::fs::rename(&temp_path, path).map_err(|e| {
+        let _ = std::fs::remove_file(&temp_path);
+        format!("Error al reemplazar {:?}: {e}", path)
+    })
 }
 
 impl AppConfig {
@@ -295,6 +414,7 @@ impl AppConfig {
         const MAX: u32 = 512;
         self.thumb_size.clamp(MIN, MAX)
     }
+
     pub fn config_path() -> PathBuf {
         match std::env::var("LOCALAPPDATA") {
             Ok(local_app) => PathBuf::from(local_app).join("swepr").join("config.json"),
@@ -303,61 +423,31 @@ impl AppConfig {
     }
 
     /// Carga la configuración desde %LOCALAPPDATA%\swepr\config.json o crea una por defecto.
+    /// Si el archivo está dañado se conserva una copia en `config.corrupt.json` antes de
+    /// volver a los valores por defecto, para no perder la configuración del usuario.
     pub fn load_or_default() -> Self {
         let path = Self::config_path();
 
-        if let Ok(mut file) = File::open(&path) {
-            let mut contents = String::new();
-            if file.read_to_string(&mut contents).is_ok() {
-                if let Ok(mut config) = serde_json::from_str::<AppConfig>(&contents) {
-                    let zones_changed = config.zones.active_zones != config.panel_side.active_zones();
+        match std::fs::read_to_string(&path) {
+            Ok(contents) => match serde_json::from_str::<AppConfig>(&contents) {
+                Ok(mut config) => {
                     config.zones.active_zones = config.panel_side.active_zones();
-                    let has_all_hotkeys = serde_json::from_str::<serde_json::Value>(&contents)
-                        .ok()
-                        .and_then(|value| value.get("hotkeys").cloned())
-                        .map(|hotkeys| ["open_panel", "previous_wallpaper", "next_wallpaper"]
-                            .iter()
-                            .all(|name| hotkeys.get(name).is_some()))
-                        .unwrap_or(false);
-                    let has_panel_side = serde_json::from_str::<serde_json::Value>(&contents)
-                        .ok()
-                        .and_then(|value| value.get("panel_side").cloned())
-                        .is_some();
-                    let has_panel_mode = serde_json::from_str::<serde_json::Value>(&contents)
-                        .ok()
-                        .and_then(|value| value.get("panel_mode").cloned())
-                        .is_some();
-                    let has_thumb_loading = serde_json::from_str::<serde_json::Value>(&contents)
-                        .ok()
-                        .and_then(|value| value.get("thumb_loading").cloned())
-                        .is_some();
-                    let has_wallpaper_fade = serde_json::from_str::<serde_json::Value>(&contents)
-                        .ok()
-                        .and_then(|value| value.get("wallpaper_fade").cloned())
-                        .is_some();
-                    let has_show_scrollbar = serde_json::from_str::<serde_json::Value>(&contents)
-                        .ok()
-                        .and_then(|value| value.get("show_scrollbar").cloned())
-                        .is_some();
-                    let has_panel_margin = serde_json::from_str::<serde_json::Value>(&contents)
-                        .ok()
-                        .and_then(|value| value.get("panel_margin").cloned())
-                        .is_some();
-                    let has_language = serde_json::from_str::<serde_json::Value>(&contents)
-                        .ok()
-                        .and_then(|value| value.get("language").cloned())
-                        .is_some();
-                    let has_legacy_acrylic = serde_json::from_str::<serde_json::Value>(&contents)
-                        .ok()
-                        .map(|value| value.get("acrylic_enabled").is_some() || value.get("acrylic_opacity").is_some())
-                        .unwrap_or(false);
-                    if !has_all_hotkeys || !has_panel_side || !has_panel_mode || !has_thumb_loading || !has_wallpaper_fade || !has_show_scrollbar || !has_panel_margin || !has_language || has_legacy_acrylic || zones_changed {
+                    // Reescribir si faltaban campos, sobraban (opciones antiguas) o cambió algo.
+                    let normalized = serde_json::to_string_pretty(&config).unwrap_or_default();
+                    if normalized.trim_end() != contents.trim_end() {
                         let _ = config.save();
                     }
                     log_info!("Configuración general cargada desde {:?}", path);
                     return config;
                 }
-            }
+                Err(e) => {
+                    let backup = path.with_file_name("config.corrupt.json");
+                    log_error!("Configuración dañada ({e}). Se guarda una copia en {:?} y se usan valores por defecto.", backup);
+                    let _ = std::fs::copy(&path, &backup);
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => log_error!("No se pudo leer {:?}: {e}", path),
         }
 
         let default_config = Self::default();
@@ -365,24 +455,43 @@ impl AppConfig {
         default_config
     }
 
-    /// Guarda la configuración actual a disco en formato JSON legible.
+    /// Guarda la configuración actual a disco en formato JSON legible (de forma atómica).
     pub fn save(&self) -> Result<(), String> {
         let path = Self::config_path();
-        if let Some(parent) = path.parent() {
-            let _ = create_dir_all(parent);
-        }
-
         let serialized = serde_json::to_string_pretty(self)
             .map_err(|e| format!("Error al serializar configuración: {e}"))?;
-
-        let mut file = File::create(&path)
-            .map_err(|e| format!("Error al crear {:?}: {e}", path))?;
-
-        file.write_all(serialized.as_bytes())
-            .map_err(|e| format!("Error al escribir {:?}: {e}", path))?;
-
+        write_atomically(&path, serialized.as_bytes())?;
         log_info!("Configuración persistida en {:?}", path);
         Ok(())
+    }
+
+    pub fn is_favorite(&self, path: &Path) -> bool {
+        self.favorites.iter().any(|favorite| crate::winutil::same_path(favorite, path))
+    }
+
+    pub fn is_excluded(&self, path: &Path) -> bool {
+        self.excluded.iter().any(|excluded| crate::winutil::same_path(excluded, path))
+    }
+
+    /// Quita una imagen de la galería (sin tocar el archivo). Devuelve si no estaba ya quitada.
+    pub fn exclude(&mut self, path: &Path) -> bool {
+        if self.is_excluded(path) {
+            return false;
+        }
+        self.excluded.push(path.to_path_buf());
+        true
+    }
+
+    /// Marca o desmarca una favorita. Devuelve si queda marcada.
+    pub fn toggle_favorite(&mut self, path: &Path) -> bool {
+        let before = self.favorites.len();
+        self.favorites.retain(|favorite| !crate::winutil::same_path(favorite, path));
+        if self.favorites.len() == before {
+            self.favorites.push(path.to_path_buf());
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -409,5 +518,70 @@ mod hotkey_tests {
     fn same_as_ignores_order_and_case() {
         assert!(binding(&["alt", "Control"], "p").same_as(&binding(&["CTRL", "ALT"], "P")));
         assert!(!binding(&["CTRL", "ALT"], "P").same_as(&binding(&["CTRL", "WIN"], "P")));
+    }
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_values_and_missing_fields_load() {
+        let json = r#"{"wallpaper_dir":"C:\\Fotos","sort_by":"Date","fit_mode":"Fit","acrylic_enabled":true}"#;
+        let config: AppConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.sort_by, SortOrder::Date);
+        assert_eq!(config.fit_mode, FitMode::Fit);
+        assert_eq!(config.thumb_size, 128);
+        assert_eq!(config.hotkeys, HotkeyConfig::default());
+        assert_eq!(config.rotation_minutes, 0);
+        assert_eq!(config.wallpaper_dir, PathBuf::from(r"C:\Fotos"));
+    }
+
+    #[test]
+    fn config_roundtrips() {
+        let config = AppConfig {
+            fit_mode: FitMode::Span,
+            sort_by: SortOrder::Date,
+            favorites: vec![PathBuf::from(r"C:\a.jpg")],
+            ..AppConfig::default()
+        };
+        let json = serde_json::to_string_pretty(&config).unwrap();
+        assert_eq!(serde_json::from_str::<AppConfig>(&json).unwrap(), config);
+    }
+
+    #[test]
+    fn toggle_favorite_ignores_case() {
+        let mut config = AppConfig::default();
+        assert!(config.toggle_favorite(Path::new(r"C:\Fotos\A.jpg")));
+        assert!(config.is_favorite(Path::new(r"c:\fotos\a.JPG")));
+        assert!(!config.toggle_favorite(Path::new(r"c:\fotos\a.jpg")));
+        assert!(config.favorites.is_empty());
+    }
+
+    #[test]
+    fn exclude_is_idempotent_and_ignores_case() {
+        let mut config = AppConfig::default();
+        assert!(config.exclude(Path::new(r"C:\Fotos\A.jpg")));
+        assert!(!config.exclude(Path::new(r"c:\fotos\a.jpg")));
+        assert!(config.is_excluded(Path::new(r"C:\FOTOS\A.JPG")));
+        assert_eq!(config.excluded.len(), 1);
+    }
+
+    #[test]
+    fn random_transition_resolves_to_a_concrete_effect() {
+        for pick in 0..10 {
+            let effect = Transition::Random.resolve(|_| pick);
+            assert_ne!(effect, Transition::Random);
+        }
+        assert_eq!(Transition::Wipe.resolve(|_| unreachable!()), Transition::Wipe);
+    }
+
+    #[test]
+    fn write_atomically_replaces_file() {
+        let path = std::env::temp_dir().join(format!("swepr-atomic-{}.json", std::process::id()));
+        write_atomically(&path, b"uno").unwrap();
+        write_atomically(&path, b"dos").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "dos");
+        let _ = std::fs::remove_file(&path);
     }
 }

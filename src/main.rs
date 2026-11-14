@@ -1,6 +1,7 @@
 #![windows_subsystem = "windows"]
 
 mod app;
+mod canvas;
 mod config;
 mod detector;
 mod i18n;
@@ -29,6 +30,13 @@ fn main() {
             return;
         }
     };
+
+    // Con panic = "abort" el proceso termina en seco: al menos que quede en el log.
+    std::panic::set_hook(Box::new(|info| {
+        let thread = std::thread::current();
+        log_error!("PÁNICO en el hilo {:?}: {info}", thread.name().unwrap_or("<sin nombre>"));
+        log_error!("Traza: {}", std::backtrace::Backtrace::force_capture());
+    }));
 
     let pid = std::process::id();
     log_info!("==================================================");
