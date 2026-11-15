@@ -26,6 +26,21 @@ pub struct AppConfig {
     pub panel_side: PanelSide,
     pub panel_mode: PanelMode,
     pub pro_priority: ProPriority,
+    /// Cómo se ve el modo Pro.
+    pub pro_style: ProStyle,
+    /// Al cambiar de fondo (atajo, bandeja, rotación o desde un panel, cuando este se cierra), el notch avisa con
+    /// una miniatura y el nombre.
+    pub notch_notify: bool,
+    /// Con el lienzo, la imagen elegida en el panel se ve en el escritorio antes de aplicarla.
+    pub live_preview: bool,
+    /// Reloj dibujado en el lienzo, detrás de los iconos.
+    pub clock: ClockConfig,
+    /// Con el lienzo, los GIF y WebP animados se reproducen (si no, se ve el primer fotograma).
+    pub animated_wallpapers: bool,
+    /// Nombres de los fondos en el notch, las galerías Pro y el aviso de cambio.
+    pub show_names: bool,
+    /// Claro, oscuro o el de Windows, para la configuración y los paneles.
+    pub theme: Theme,
     pub thumb_loading: ThumbLoading,
     /// Cambiar el fondo con el fundido nativo de Windows.
     pub wallpaper_fade: bool,
@@ -157,6 +172,21 @@ pub enum PanelMode {
     LowPower,
     /// Carrusel de tarjetas inclinadas en el centro de la pantalla.
     Pro,
+    /// Isla negra pegada al borde superior que crece hasta mostrar la galería.
+    Notch,
+}
+
+impl PanelMode {
+    /// Orden de las opciones en el desplegable de la configuración.
+    pub const ALL: [PanelMode; 3] = [PanelMode::LowPower, PanelMode::Pro, PanelMode::Notch];
+
+    pub fn index(self) -> usize {
+        Self::ALL.iter().position(|mode| *mode == self).unwrap_or(0)
+    }
+
+    pub fn from_index(index: usize) -> Self {
+        Self::ALL.get(index).copied().unwrap_or_default()
+    }
 }
 
 /// Prioridad de carga del carrusel Pro.
@@ -168,6 +198,151 @@ pub enum ProPriority {
     /// Conserva en memoria solo las tarjetas cercanas al área visible.
     #[default]
     Performance,
+}
+
+/// Aspecto del modo Pro.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ProStyle {
+    /// Tarjetas inclinadas en primer plano con nombre, acciones y filtros (Direct2D).
+    #[default]
+    Showcase,
+    /// Tarjetas abiertas en abanico que giran al navegar (Direct2D).
+    Fan,
+    /// Cuadrícula a pantalla completa con búsqueda por nombre (Direct2D).
+    Mosaic,
+    /// La imagen enfocada a casi toda la pantalla dentro de un marco claro, con un cuadro de
+    /// búsqueda, colores y acciones en una esquina y las miniaturas en cascada en la opuesta (Direct2D).
+    Frame,
+    /// El carrusel GDI de siempre.
+    Classic,
+}
+
+impl ProStyle {
+    pub const ALL: [ProStyle; 5] = [ProStyle::Showcase, ProStyle::Fan, ProStyle::Mosaic, ProStyle::Frame, ProStyle::Classic];
+
+    pub fn index(self) -> usize {
+        Self::ALL.iter().position(|style| *style == self).unwrap_or(0)
+    }
+
+    pub fn from_index(index: usize) -> Self {
+        Self::ALL.get(index).copied().unwrap_or_default()
+    }
+}
+
+/// Reloj del escritorio (solo con el lienzo SWEPR).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ClockConfig {
+    pub enabled: bool,
+    pub style: ClockStyle,
+    pub position: ClockPosition,
+    pub size: ClockSize,
+    pub hour24: bool,
+    pub seconds: bool,
+    pub date: bool,
+    /// Solo en el monitor principal (si no, en todos).
+    pub main_monitor_only: bool,
+}
+
+impl Default for ClockConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            style: ClockStyle::Large,
+            position: ClockPosition::Center,
+            size: ClockSize::Medium,
+            hour24: true,
+            seconds: false,
+            date: true,
+            main_monitor_only: false,
+        }
+    }
+}
+
+/// Aspecto del reloj.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ClockStyle {
+    /// Hora grande y fina con la fecha debajo.
+    #[default]
+    Large,
+    /// Cápsula translúcida con la hora y la fecha.
+    Pill,
+    /// Esfera con agujas.
+    Analog,
+    /// Cifras gruesas: las horas encima de los minutos.
+    Stacked,
+    /// Saludo según la hora del día, la hora grande y la fecha.
+    Greeting,
+}
+
+/// Dónde va el reloj en el monitor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ClockPosition {
+    #[default]
+    Center,
+    TopLeft,
+    TopRight,
+    /// Borde izquierdo, a media altura.
+    Left,
+    /// Borde derecho, a media altura.
+    Right,
+    BottomLeft,
+    BottomRight,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ClockSize {
+    Small,
+    #[default]
+    Medium,
+    Large,
+}
+
+/// Índice en su desplegable de la configuración (el orden de `ALL`).
+macro_rules! combo_enum {
+    ($name:ident, [$($variant:ident),+]) => {
+        impl $name {
+            pub const ALL: &'static [$name] = &[$($name::$variant),+];
+            pub fn index(self) -> usize { Self::ALL.iter().position(|v| *v == self).unwrap_or(0) }
+            pub fn from_index(index: usize) -> Self { Self::ALL.get(index).copied().unwrap_or_default() }
+        }
+    };
+}
+combo_enum!(ClockStyle, [Large, Pill, Analog, Greeting, Stacked]);
+combo_enum!(ClockPosition, [Center, TopLeft, TopRight, Left, Right, BottomLeft, BottomRight]);
+combo_enum!(ClockSize, [Small, Medium, Large]);
+
+/// Colores de la interfaz.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Theme {
+    /// El modo de las apps de Windows.
+    System,
+    #[default]
+    Dark,
+    Light,
+}
+
+impl Theme {
+    /// En el orden del desplegable de la configuración.
+    pub const ALL: [Theme; 3] = [Theme::System, Theme::Dark, Theme::Light];
+
+    pub fn index(self) -> usize { Self::ALL.iter().position(|t| *t == self).unwrap_or(1) }
+
+    pub fn from_index(index: usize) -> Self { Self::ALL.get(index).copied().unwrap_or_default() }
+
+    /// Código para `winutil::set_theme`.
+    pub fn code(self) -> u8 {
+        match self {
+            Theme::System => 0,
+            Theme::Dark => 1,
+            Theme::Light => 2,
+        }
+    }
 }
 
 /// Cuándo se generan las miniaturas pequeñas de la galería.
@@ -182,7 +357,9 @@ pub enum ThumbLoading {
 }
 
 impl PanelSide {
-    pub fn active_zones(self) -> Vec<ZoneType> {
+    /// Zonas del sensor que abren el panel. El notch solo se abre arriba en el centro.
+    pub fn active_zones(self, mode: PanelMode) -> Vec<ZoneType> {
+        if mode == PanelMode::Notch { return vec![ZoneType::Top]; }
         match self {
             Self::Top => vec![ZoneType::TopLeft, ZoneType::Top, ZoneType::TopRight],
             Self::Left => vec![ZoneType::TopLeft, ZoneType::Left, ZoneType::BottomLeft],
@@ -368,6 +545,13 @@ impl Default for AppConfig {
             panel_side: PanelSide::Top,
             panel_mode: PanelMode::LowPower,
             pro_priority: ProPriority::Performance,
+            pro_style: ProStyle::Showcase,
+            notch_notify: true,
+            live_preview: true,
+            show_names: true,
+            animated_wallpapers: true,
+            clock: ClockConfig::default(),
+            theme: Theme::Dark,
             thumb_loading: ThumbLoading::Preload,
             wallpaper_fade: default_wallpaper_fade(),
             show_scrollbar: default_show_scrollbar(),
@@ -431,7 +615,7 @@ impl AppConfig {
         match std::fs::read_to_string(&path) {
             Ok(contents) => match serde_json::from_str::<AppConfig>(&contents) {
                 Ok(mut config) => {
-                    config.zones.active_zones = config.panel_side.active_zones();
+                    config.zones.active_zones = config.panel_side.active_zones(config.panel_mode);
                     // Reescribir si faltaban campos, sobraban (opciones antiguas) o cambió algo.
                     let normalized = serde_json::to_string_pretty(&config).unwrap_or_default();
                     if normalized.trim_end() != contents.trim_end() {

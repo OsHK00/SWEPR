@@ -216,6 +216,114 @@ pub fn random_below(bound: usize) -> usize {
     (x % bound as u64) as usize
 }
 
+/// Acento por defecto de Windows 11 sobre fondo oscuro (#4CC2FF).
+pub const DEFAULT_ACCENT: (u8, u8, u8) = (0x4C, 0xC2, 0xFF);
+/// Acento por defecto de Windows 11 sobre fondo claro (#005FB8).
+pub const DEFAULT_ACCENT_ON_LIGHT: (u8, u8, u8) = (0x00, 0x5F, 0xB8);
+
+/// Tema elegido en la configuración: 0 = el de Windows, 1 = oscuro, 2 = claro.
+static THEME: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(1);
+
+pub fn set_theme(choice: u8) { THEME.store(choice, std::sync::atomic::Ordering::Relaxed); }
+
+/// ¿Se pinta la interfaz en claro? Con "el de Windows", lo que diga el sistema para las apps.
+pub fn light_theme() -> bool {
+    match THEME.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => system_light(),
+    }
+}
+
+/// Modo de las apps de Windows (claro u oscuro), releído cada pocos segundos.
+fn system_light() -> bool {
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    static CACHE: Mutex<Option<(Instant, bool)>> = Mutex::new(None);
+    if let Ok(guard) = CACHE.lock() {
+        if let Some((read, light)) = *guard {
+            if read.elapsed() < Duration::from_secs(5) { return light; }
+        }
+    }
+    let light = unsafe {
+        use windows::core::w;
+        use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
+        let mut value = 0u32;
+        let mut size = 4u32;
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            w!(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"),
+            w!("AppsUseLightTheme"),
+            RRF_RT_REG_DWORD,
+            None,
+            Some(&mut value as *mut _ as *mut _),
+            Some(&mut size),
+        )
+        .is_ok()
+            && value != 0
+    };
+    if let Ok(mut guard) = CACHE.lock() { *guard = Some((Instant::now(), light)); }
+    light
+}
+
+/// Color de acento del sistema como (r, g, b): la variante clara sobre el tema oscuro y la
+/// oscura sobre el claro, como hace Windows. Se relee cada pocos segundos por si cambia.
+pub fn accent_rgb() -> (u8, u8, u8) {
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    type Rgb = (u8, u8, u8);
+    type Cached = Option<(Instant, (Rgb, Rgb))>;
+    static CACHE: Mutex<Cached> = Mutex::new(None);
+    let pick = |(on_dark, on_light): (Rgb, Rgb)| if light_theme() { on_light } else { on_dark };
+    if let Ok(guard) = CACHE.lock() {
+        if let Some((read, pair)) = *guard {
+            if read.elapsed() < Duration::from_secs(5) { return pick(pair); }
+        }
+    }
+    let pair = read_accent().unwrap_or((DEFAULT_ACCENT, DEFAULT_ACCENT_ON_LIGHT));
+    if let Ok(mut guard) = CACHE.lock() { *guard = Some((Instant::now(), pair)); }
+    pick(pair)
+}
+
+/// (acento sobre oscuro, acento sobre claro).
+type AccentPair = ((u8, u8, u8), (u8, u8, u8));
+
+fn read_accent() -> Option<AccentPair> {
+    use windows::core::w;
+    use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_BINARY, RRF_RT_REG_DWORD};
+    unsafe {
+        // Paleta de 8 colores RGBA; la segunda entrada es el acento "claro 2" y la quinta, "oscuro 1".
+        let mut palette = [0u8; 32];
+        let mut size = palette.len() as u32;
+        let read = RegGetValueW(
+            HKEY_CURRENT_USER,
+            w!(r"Software\Microsoft\Windows\CurrentVersion\Explorer\Accent"),
+            w!("AccentPalette"),
+            RRF_RT_REG_BINARY,
+            None,
+            Some(palette.as_mut_ptr() as *mut _),
+            Some(&mut size),
+        );
+        if read.is_ok() && size >= 20 {
+            return Some(((palette[4], palette[5], palette[6]), (palette[16], palette[17], palette[18])));
+        }
+        // Sin paleta: el acento base (ABGR).
+        let mut value = 0u32;
+        let mut size = 4u32;
+        let read = RegGetValueW(
+            HKEY_CURRENT_USER,
+            w!(r"Software\Microsoft\Windows\DWM"),
+            w!("AccentColor"),
+            RRF_RT_REG_DWORD,
+            None,
+            Some(&mut value as *mut _ as *mut _),
+            Some(&mut size),
+        );
+        let base = (value as u8, (value >> 8) as u8, (value >> 16) as u8);
+        read.is_ok().then_some((base, base))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

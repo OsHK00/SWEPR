@@ -139,7 +139,7 @@ unsafe fn selected_indices(hwnd: HWND) -> Vec<usize> {
 }
 
 unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    use super::theme::{brush, COLOR_FIELD_BG, COLOR_LABEL, COLOR_TEXT, COLOR_WINDOW_BG};
+    use super::theme::{brush, color_field_bg, color_label, color_text, color_window_bg};
     match msg {
         WM_CREATE => {
             add_control(hwnd, "STATIC", &tr("These images are not shown in the gallery. Their files were not deleted."), 0, (16, 12, 608, 36), 0);
@@ -155,21 +155,21 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
         windows::Win32::UI::WindowsAndMessaging::WM_ERASEBKGND => {
             let mut rect = RECT::default();
             let _ = windows::Win32::UI::WindowsAndMessaging::GetClientRect(hwnd, &mut rect);
-            let _ = FillRect(HDC(wparam.0 as *mut _), &rect, brush(COLOR_WINDOW_BG));
+            let _ = FillRect(HDC(wparam.0 as *mut _), &rect, brush(color_window_bg()));
             LRESULT(1)
         }
         windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORSTATIC | windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORBTN => {
             let dc = HDC(wparam.0 as *mut _);
-            let _ = SetTextColor(dc, COLOR_LABEL);
+            let _ = SetTextColor(dc, color_label());
             let _ = SetBkMode(dc, TRANSPARENT);
-            LRESULT(brush(COLOR_WINDOW_BG).0 as isize)
+            LRESULT(brush(color_window_bg()).0 as isize)
         }
         windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORLISTBOX => {
             let dc = HDC(wparam.0 as *mut _);
-            let _ = SetTextColor(dc, COLOR_TEXT);
-            let _ = SetBkColor(dc, COLOR_FIELD_BG);
+            let _ = SetTextColor(dc, color_text());
+            let _ = SetBkColor(dc, color_field_bg());
             let _ = SetBkMode(dc, OPAQUE);
-            LRESULT(brush(COLOR_FIELD_BG).0 as isize)
+            LRESULT(brush(color_field_bg()).0 as isize)
         }
         WM_COMMAND => {
             match (wparam.0 & 0xFFFF) as i32 {
@@ -244,20 +244,7 @@ pub fn show(owner: HWND, config: Arc<Mutex<AppConfig>>) {
             STATE.with(|state| *state.borrow_mut() = None);
             return;
         };
-        let dark = windows::Win32::Foundation::BOOL(1);
-        let _ = windows::Win32::Graphics::Dwm::DwmSetWindowAttribute(
-            hwnd,
-            windows::Win32::Graphics::Dwm::DWMWA_USE_IMMERSIVE_DARK_MODE,
-            &dark as *const _ as *const std::ffi::c_void,
-            std::mem::size_of_val(&dark) as u32,
-        );
-        let caption = COLOR_CAPTION;
-        let _ = windows::Win32::Graphics::Dwm::DwmSetWindowAttribute(
-            hwnd,
-            windows::Win32::Graphics::Dwm::DWMWA_CAPTION_COLOR,
-            &caption as *const _ as *const std::ffi::c_void,
-            std::mem::size_of_val(&caption) as u32,
-        );
+        super::theme::apply_window_frame(hwnd);
         WINDOW.with(|w| w.set(Some(hwnd)));
         // Modal respecto a la configuración.
         let _ = EnableWindow(owner, false);
@@ -265,4 +252,3 @@ pub fn show(owner: HWND, config: Arc<Mutex<AppConfig>>) {
     }
 }
 
-const COLOR_CAPTION: windows::Win32::Foundation::COLORREF = super::theme::COLOR_WINDOW_BG;

@@ -73,6 +73,10 @@ pub enum Action {
     Reveal(PathBuf),
     /// Quitar de la galería sin borrar el archivo.
     Exclude(PathBuf),
+    /// Enseñar la imagen en el escritorio (con el lienzo) sin aplicarla, en el monitor `RECT`.
+    Preview(PathBuf, RECT),
+    /// Quitar la vista previa y volver al fondo puesto.
+    EndPreview,
 }
 
 static PENDING_ACTIONS: Mutex<VecDeque<Action>> = Mutex::new(VecDeque::new());
@@ -228,6 +232,8 @@ pub struct AppState {
     last_mtimes: HashMap<PathBuf, SystemTime>,
     /// Lienzo detrás de los iconos (modo de aplicación "Lienzo SWEPR").
     canvas: Option<crate::canvas::Canvas>,
+    /// Hay una vista previa en el lienzo (se deshace al cerrar el panel sin aplicar).
+    previewing: bool,
 }
 
 impl AppState {
@@ -384,6 +390,8 @@ impl AppState {
         self.canvas = None;
         match crate::canvas::Canvas::start() {
             Ok(canvas) => {
+                let clock = self.config().clock.clone();
+                canvas.set_clock(clock.enabled.then_some(clock));
                 self.canvas = Some(canvas);
                 self.restore_canvas();
             }
@@ -392,20 +400,23 @@ impl AppState {
     }
 
     /// Dibuja en el lienzo, sin transición, lo que Windows tiene puesto ahora en cada monitor.
-    fn restore_canvas(&self) {
+    fn restore_canvas(&self) { self.restore_canvas_with(std::time::Duration::ZERO, crate::config::Transition::Fade); }
+
+    /// Como `restore_canvas`, con un fundido de `fade` (al quitar una vista previa).
+    fn restore_canvas_with(&self, fade: std::time::Duration, transition: crate::config::Transition) {
         let Some(canvas) = self.canvas.as_ref() else { return; };
         let fit = self.config().fit_mode;
-        let zero = std::time::Duration::ZERO;
+        let zero = fade;
         let monitors = self.wallpaper_manager.monitors();
         if fit == FitMode::Span || monitors.is_empty() {
             if let Some(path) = self.current_wallpaper() {
-                canvas.show(&path, crate::canvas::Target::All, fit, zero, crate::config::Transition::Fade);
+                canvas.show(&path, crate::canvas::Target::All, fit, zero, transition);
             }
             return;
         }
         for (id, rect) in monitors {
             if let Some(path) = self.wallpaper_manager.wallpaper_of(&id).or_else(|| self.current_wallpaper()) {
-                canvas.show(&path, crate::canvas::Target::Monitor(rect), fit, zero, crate::config::Transition::Fade);
+                canvas.show(&path, crate::canvas::Target::Monitor(rect), fit, zero, transition);
             }
         }
     }
@@ -430,6 +441,8 @@ impl AppState {
             id.map(|id| (id, rect))
         });
         let previous = self.current_wallpaper();
+        // Lo que se ve ahora en el lienzo pasa a ser el fondo de verdad.
+        self.previewing = false;
         match self.set_wallpaper_on(path, monitor, true) {
             Ok(_) => {
                 log_info!("Wallpaper aplicado correctamente.");
@@ -448,7 +461,20 @@ impl AppState {
         }
     }
 
+    /// Cambio de fondo sin el panel (atajo, bandeja o rotación): con aviso en el notch si se pidió.
     fn step(&mut self, step: Step, favorites_only: bool) {
+        let before = self.current_wallpaper();
+        self.step_quietly(step, favorites_only);
+        let after = self.current_wallpaper();
+        if let Some(after) = after {
+            let changed = before.as_ref().is_none_or(|before| !same_path(before, &after));
+            if changed && self.config().notch_notify {
+                panel::notify_wallpaper(&after);
+            }
+        }
+    }
+
+    fn step_quietly(&mut self, step: Step, favorites_only: bool) {
         let step = if step == Step::Next && self.config().shuffle { Step::Random } else { step };
         // En modo aleatorio, "anterior" vuelve al fondo de antes.
         if step == Step::Previous && self.config().shuffle && !self.history.is_empty() {
@@ -474,12 +500,36 @@ impl AppState {
         }
     }
 
+    /// Enseña una imagen en el lienzo sin tocar el fondo de Windows.
+    fn preview(&mut self, path: &Path, rect: RECT) {
+        let (mode, enabled, fit, transition) = {
+            let config = self.config();
+            (config.apply_mode, config.live_preview, config.fit_mode, (config.transition, config.transition_ms))
+        };
+        if mode != ApplyMode::Canvas || !enabled { return; }
+        self.ensure_canvas();
+        let Some(canvas) = self.canvas.as_ref() else { return; };
+        // Extendida, la imagen ocupa todos los monitores; si no, solo el del panel.
+        let target = if fit == FitMode::Span { crate::canvas::Target::All } else { crate::canvas::Target::Monitor(rect) };
+        // Con la transición configurada: al aplicar después, la imagen ya está puesta y no
+        // habría otra animación que ver.
+        let (effect, ms) = transition;
+        canvas.show(path, target, fit, std::time::Duration::from_millis(ms as u64), effect);
+        self.previewing = true;
+    }
+
     fn handle_action(&mut self, action: Action) {
         match action {
             Action::ApplyToMonitor(path, rect) => self.apply(&path, Some(rect), true),
             Action::ApplyFromPanel(path, rect) => {
                 let monitor = self.per_monitor_ids().map(|_| rect);
+                let before = self.current_wallpaper();
                 self.apply(&path, monitor, true);
+                // El aviso también sale al elegir desde el panel, cuando este termina de cerrarse.
+                let changed = before.as_ref().is_none_or(|before| !same_path(before, &path));
+                if changed && self.config().notch_notify {
+                    panel::notify_wallpaper(&path);
+                }
             }
             Action::LockScreen(path) => crate::wallpaper::set_lock_screen(&path),
             Action::ToggleFavorite(path) => {
@@ -522,6 +572,13 @@ impl AppState {
                 log_info!("Quitada de la galería: {:?}", path);
                 // Las escalas del panel dependen del número de imágenes.
                 panel::set_draw_context(self.thumb_cache.clone(), self.scanned_images.clone());
+            }
+            Action::Preview(path, rect) => self.preview(&path, rect),
+            Action::EndPreview => {
+                if std::mem::take(&mut self.previewing) {
+                    let (effect, ms) = { let c = self.config(); (c.transition, c.transition_ms) };
+                    self.restore_canvas_with(std::time::Duration::from_millis(ms as u64), effect);
+                }
             }
         }
     }
@@ -568,8 +625,13 @@ impl AppState {
 
         crate::i18n::set_language(new.language.clone());
         panel::set_panel_side(new.panel_side);
+        panel::set_pro_style(new.pro_style);
         panel::set_panel_mode(new.panel_mode);
         panel::set_pro_priority(new.pro_priority);
+        panel::set_live_preview(new.live_preview && new.apply_mode == ApplyMode::Canvas);
+        panel::set_show_names(new.show_names);
+        crate::canvas::set_animations(new.animated_wallpapers);
+        crate::winutil::set_theme(new.theme.code());
         panel::set_scrollbar_visible(new.show_scrollbar);
         panel::set_panel_margin(new.panel_margin);
         panel::set_thumbnail_loading(new.thumb_loading == ThumbLoading::OnDemand, new.thumb_size_value() as i32);
@@ -582,9 +644,9 @@ impl AppState {
             panel::clear_carousel_tiles();
         }
 
-        if old.zones != new.zones || old.panel_side != new.panel_side {
+        if old.zones != new.zones || old.panel_side != new.panel_side || old.panel_mode != new.panel_mode {
             let mut zones = new.zones.clone();
-            zones.active_zones = new.panel_side.active_zones();
+            zones.active_zones = new.panel_side.active_zones(new.panel_mode);
             self.zone_detector.update_config(zones);
         }
 
@@ -607,9 +669,14 @@ impl AppState {
         if old.apply_mode != new.apply_mode {
             log_info!("Modo de aplicación: {:?}", new.apply_mode);
             self.ensure_canvas();
-        } else if self.canvas.is_some() && old.fit_mode != new.fit_mode {
-            // El ajuste nuevo se ve enseguida en lo que ya está puesto.
+        } else if self.canvas.is_some() && (old.fit_mode != new.fit_mode || old.animated_wallpapers != new.animated_wallpapers) {
+            // El ajuste nuevo (o animar o no) se ve enseguida en lo que ya está puesto.
             self.restore_canvas();
+        }
+        if old.clock != new.clock && old.apply_mode == new.apply_mode {
+            if let Some(canvas) = self.canvas.as_ref() {
+                canvas.set_clock(new.clock.enabled.then(|| new.clock.clone()));
+            }
         }
     }
 
@@ -881,8 +948,13 @@ impl App {
         let config = AppConfig::load_or_default();
         crate::i18n::set_language(config.language.clone());
         panel::set_panel_side(config.panel_side);
+        panel::set_pro_style(config.pro_style);
         panel::set_panel_mode(config.panel_mode);
         panel::set_pro_priority(config.pro_priority);
+        panel::set_live_preview(config.live_preview && config.apply_mode == ApplyMode::Canvas);
+        panel::set_show_names(config.show_names);
+        crate::canvas::set_animations(config.animated_wallpapers);
+        crate::winutil::set_theme(config.theme.code());
         panel::set_thumbnail_loading(config.thumb_loading == ThumbLoading::OnDemand, config.thumb_size_value() as i32);
         panel::set_scrollbar_visible(config.show_scrollbar);
         panel::set_panel_margin(config.panel_margin);
@@ -997,6 +1069,7 @@ impl App {
             history: Vec::new(),
             last_mtimes: HashMap::new(),
             canvas: None,
+            previewing: false,
         });
         state.zone_detector.thumb_cache = Some(state.thumb_cache.clone());
         state.zone_detector.scanned_images = Some(state.scanned_images.clone());

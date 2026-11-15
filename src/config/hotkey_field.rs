@@ -20,7 +20,7 @@ pub const CLASS_NAME: &str = "SWEPR_HotkeyField";
 pub const HKM_SETHOTKEY: u32 = 0x0401;
 pub const HKM_GETHOTKEY: u32 = 0x0402;
 
-use super::theme::{COLOR_MUTED as COLOR_PLACEHOLDER, COLOR_TEXT};
+use super::theme::{color_muted, color_text};
 const TEXT_PADDING: i32 = 10;
 
 pub fn register_class(hinstance: windows::Win32::Foundation::HINSTANCE) {
@@ -130,9 +130,9 @@ unsafe extern "system" fn field_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
             let value = (GetWindowLongPtrW(hwnd, GWLP_USERDATA) & 0xFFFF) as u16;
             let text = hotkey_text(value);
             let (text, color) = if text.is_empty() {
-                (crate::i18n::t("None"), COLOR_PLACEHOLDER)
+                (crate::i18n::t("None"), color_muted())
             } else {
-                (text, COLOR_TEXT)
+                (text, color_text())
             };
             let font = super::window::ui_font();
             let old_font = (font != 0).then(|| SelectObject(dc, HGDIOBJ(font as *mut _)));

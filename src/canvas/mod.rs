@@ -8,17 +8,23 @@
 //! - Lienzo: dueño de la ventana y de Direct2D. Como su ventana es hija de una ventana del
 //!   Explorador, este hilo comparte cola de entrada con él: nunca debe bloquearse, solo dibuja.
 //!
-//! Solo se dibuja durante las transiciones; con el fondo quieto no consume nada.
+//! Solo se dibuja durante las transiciones y, con un fondo animado (GIF/WebP), al cambiar de
+//! fotograma; con el fondo quieto no consume nada.
 
+mod anim;
+mod clock;
 mod layout;
 
+pub use anim::set_enabled as set_animations;
 pub use layout::Area;
 use layout::{decode_size, layout_rects};
 
 use crate::config::{FitMode, Transition};
 use crate::{log_error, log_info, log_warn};
 use std::collections::HashMap;
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
@@ -29,7 +35,7 @@ use windows::Win32::Graphics::Direct2D::Common::{
     D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_ALPHA_MODE_UNKNOWN, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_POINT_2F, D2D_SIZE_U,
 };
 use windows::Win32::Graphics::Direct2D::{
-    D2D1CreateFactory, ID2D1Bitmap, ID2D1Factory, ID2D1HwndRenderTarget, ID2D1Layer, D2D1_ANTIALIAS_MODE_ALIASED,
+    D2D1CreateFactory, ID2D1Bitmap, ID2D1Factory, ID2D1Layer, ID2D1RenderTarget, D2D1_ANTIALIAS_MODE_ALIASED,
     D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_ELLIPSE, D2D1_LAYER_OPTIONS_NONE, D2D1_LAYER_PARAMETERS,
     D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_BITMAP_PROPERTIES, D2D1_FACTORY_TYPE_SINGLE_THREADED,
     D2D1_FEATURE_LEVEL_DEFAULT, D2D1_HWND_RENDER_TARGET_PROPERTIES, D2D1_PRESENT_OPTIONS_NONE,
@@ -84,6 +90,30 @@ struct Frame {
     fit: FitMode,
     duration: Duration,
     effect: Transition,
+    /// Brillo del fondo en una rejilla de 3x3 (para el color del reloj).
+    luma: [f32; 9],
+}
+
+/// Todos los fotogramas de un fondo animado, que llegan después de su primer fotograma.
+struct AnimFrames {
+    path: PathBuf,
+    target: Target,
+    fit: FitMode,
+    frames: Vec<Vec<u8>>,
+    delays: Vec<Duration>,
+    width: u32,
+    height: u32,
+    luma: [f32; 9],
+}
+
+/// Imágenes pedidas al decodificador que aún no ha recogido (para cancelar una animación a medias).
+static PENDING_JOBS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn send_job(decoder: &Sender<DecodeJob>, job: DecodeJob) {
+    PENDING_JOBS.fetch_add(1, Ordering::AcqRel);
+    if decoder.send(job).is_err() {
+        PENDING_JOBS.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 struct DecodeJob {
@@ -98,6 +128,9 @@ struct DecodeJob {
 
 enum Command {
     Show(Frame),
+    Animate(AnimFrames),
+    /// Reloj del escritorio (None = sin reloj).
+    Clock(Option<crate::config::ClockConfig>),
     Quit,
 }
 
@@ -203,7 +236,13 @@ impl Canvas {
             Target::All => monitors.iter().copied().max_by_key(|r| (r.right - r.left) * (r.bottom - r.top)).unwrap_or_default(),
         };
         let area_size = ((area.right - area.left).max(1) as u32, (area.bottom - area.top).max(1) as u32);
-        let _ = self.decoder.send(DecodeJob { path: path.to_path_buf(), target, fit, duration, effect, area_size });
+        send_job(&self.decoder, DecodeJob { path: path.to_path_buf(), target, fit, duration, effect, area_size });
+    }
+
+    /// Pone, cambia o quita el reloj del escritorio.
+    pub fn set_clock(&self, clock: Option<crate::config::ClockConfig>) {
+        let _ = self.commands.send(Command::Clock(clock));
+        unsafe { let _ = PostThreadMessageW(self.thread_id, WM_APP_CANVAS_WAKE, WPARAM(0), LPARAM(0)); }
     }
 }
 
@@ -234,8 +273,10 @@ fn decoder_loop(jobs: Receiver<DecodeJob>, commands: Sender<Command>) {
     };
     // Si llegan varias seguidas (atajos repetidos) solo cuenta la última de cada destino.
     while let Ok(first) = jobs.recv() {
+        PENDING_JOBS.fetch_sub(1, Ordering::AcqRel);
         let mut latest: Vec<DecodeJob> = vec![first];
         while let Ok(job) = jobs.try_recv() {
+            PENDING_JOBS.fetch_sub(1, Ordering::AcqRel);
             if job.target == Target::All {
                 latest.clear();
             } else {
@@ -246,10 +287,12 @@ fn decoder_loop(jobs: Receiver<DecodeJob>, commands: Sender<Command>) {
         for job in latest {
             let started = Instant::now();
             trace!("decodificando {:?}", job.path.file_name().unwrap_or_default());
-            match unsafe { decode(&factory, &job) } {
+            // Primero la imagen fija (o el primer fotograma), para que la transición empiece ya.
+            match unsafe { decode_still(&factory, &job) } {
                 Ok((pixels, width, height)) => {
                     crate::log_debug!("Lienzo: {:?} decodificada a {width}x{height} en {} ms", job.path.file_name().unwrap_or_default(), started.elapsed().as_millis());
-                    let frame = Frame { pixels, width, height, path: job.path, target: job.target, fit: job.fit, duration: job.duration, effect: job.effect };
+                    let luma = clock::region_luma(&pixels, width, height);
+                    let frame = Frame { pixels, width, height, path: job.path.clone(), target: job.target, fit: job.fit, duration: job.duration, effect: job.effect, luma };
                     if commands.send(Command::Show(frame)).is_err() {
                         return;
                     }
@@ -258,7 +301,31 @@ fn decoder_loop(jobs: Receiver<DecodeJob>, commands: Sender<Command>) {
                 Err(e) => {
                     trace!("no se pudo decodificar {:?}: {e}", job.path);
                     log_warn!("Lienzo: no se pudo abrir {:?}: {e}", job.path);
+                    continue;
                 }
+            }
+            // Después, si es animada, todos los fotogramas (se deja si mientras se pide otra imagen).
+            if !anim::enabled() || !anim::is_animated_format(&job.path) { continue; }
+            let started = Instant::now();
+            let cancel = || PENDING_JOBS.load(Ordering::Acquire) > 0;
+            match anim::decode(&job.path, |native| decode_size(job.fit, native, job.area_size), cancel) {
+                Ok(animation) if animation.frames.len() > 1 => {
+                    log_info!(
+                        "Lienzo: {:?} animada, {} fotogramas a {}x{} en {} ms",
+                        job.path.file_name().unwrap_or_default(), animation.frames.len(), animation.width, animation.height, started.elapsed().as_millis()
+                    );
+                    let luma = clock::region_luma(&animation.frames[0], animation.width, animation.height);
+                    let frames = AnimFrames {
+                        path: job.path, target: job.target, fit: job.fit, luma,
+                        frames: animation.frames, delays: animation.delays, width: animation.width, height: animation.height,
+                    };
+                    if commands.send(Command::Animate(frames)).is_err() {
+                        return;
+                    }
+                    wake_canvas();
+                }
+                Ok(_) => {}
+                Err(e) => crate::log_debug!("Lienzo: {:?} sin animar: {e}", job.path.file_name().unwrap_or_default()),
             }
         }
     }
@@ -267,6 +334,18 @@ fn decoder_loop(jobs: Receiver<DecodeJob>, commands: Sender<Command>) {
 unsafe fn wic_factory() -> windows::core::Result<windows::Win32::Graphics::Imaging::IWICImagingFactory> {
     use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
     CoCreateInstance(&windows::Win32::Graphics::Imaging::CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)
+}
+
+/// La imagen fija con WIC; un GIF o WebP que WIC no sabe abrir (sin códec de WebP), con el
+/// decodificador propio.
+unsafe fn decode_still(factory: &windows::Win32::Graphics::Imaging::IWICImagingFactory, job: &DecodeJob) -> Result<(Vec<u8>, u32, u32), String> {
+    match decode(factory, job) {
+        Ok(decoded) => Ok(decoded),
+        Err(wic) if anim::is_animated_format(&job.path) => {
+            anim::first_frame(&job.path, |native| decode_size(job.fit, native, job.area_size)).map_err(|e| format!("{e}; WIC: {wic}"))
+        }
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 /// Abre la imagen y la devuelve en BGRA premultiplicado, escalada a lo necesario para el área.
@@ -339,7 +418,24 @@ struct Layer {
     size: (f32, f32),
     fit: FitMode,
     path: PathBuf,
+    /// Fondo animado: fotogramas que se van copiando a `bitmap` (compartido por los monitores).
+    playback: Option<Rc<Playback>>,
+    luma: [f32; 9],
 }
+
+/// Reproducción de un fondo animado.
+struct Playback {
+    bitmap: ID2D1Bitmap,
+    frames: Vec<Vec<u8>>,
+    delays: Vec<Duration>,
+    stride: u32,
+    index: Cell<usize>,
+    /// Cuándo toca el siguiente fotograma.
+    due: Cell<Instant>,
+}
+
+/// Cada cuánto se mira si hay que pausar las animaciones (pantalla completa, batería...).
+const PAUSE_CHECK: Duration = Duration::from_millis(500);
 
 /// Lo que se ve en un monitor.
 struct Slot {
@@ -368,7 +464,7 @@ struct CanvasWindow {
     hwnd: HWND,
     host: DesktopHost,
     factory: ID2D1Factory,
-    target: Option<ID2D1HwndRenderTarget>,
+    target: Option<ID2D1RenderTarget>,
     /// Capa para las máscaras (transición circular); depende del destino.
     layer: Option<ID2D1Layer>,
     slots: Vec<Slot>,
@@ -376,6 +472,17 @@ struct CanvasWindow {
     virtual_area: Area,
     shown: bool,
     decoder: Sender<DecodeJob>,
+    /// Hook que avisa cuando el Explorador reordena el escritorio (solo en 24H2+).
+    hook: Option<windows::Win32::UI::Accessibility::HWINEVENTHOOK>,
+    /// Animaciones en pausa en todos los monitores (pantalla completa, ahorro de batería, bloqueo).
+    paused: bool,
+    /// Monitor tapado por una ventana maximizada (su animación se pausa).
+    covered: Option<RECT>,
+    pause_checked: Option<Instant>,
+    clock: Option<crate::config::ClockConfig>,
+    clock_painter: Option<clock::ClockPainter>,
+    /// Minuto (o segundo) que muestra el reloj dibujado.
+    clock_key: u64,
 }
 
 unsafe extern "system" fn canvas_wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -401,6 +508,43 @@ unsafe extern "system" fn canvas_wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, 
 }
 
 static NEEDS_PAINT: AtomicBool = AtomicBool::new(false);
+
+/// Ventanas que vigila el hook de reordenación (0 = sin hook): lienzo, padre (Progman) e iconos.
+static WATCH_CANVAS: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+static WATCH_PARENT: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+static WATCH_ICONS: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+
+/// Avisos del Explorador al crear, mostrar o reordenar ventanas. Al cambiar el fondo de Windows,
+/// el Explorador recrea su capa (WorkerW) encima del lienzo: sin esto se veía hasta un segundo
+/// (lo que tardaba la comprobación periódica) y el escritorio "parpadeaba". Aquí se recoloca al
+/// momento, normalmente antes de que se llegue a componer un fotograma. Llega por la cola de
+/// mensajes del hilo del lienzo.
+unsafe extern "system" fn desktop_event(
+    _hook: windows::Win32::UI::Accessibility::HWINEVENTHOOK,
+    _event: u32,
+    hwnd: HWND,
+    id_object: i32,
+    _id_child: i32,
+    _thread: u32,
+    _time: u32,
+) {
+    if id_object != 0 || hwnd.is_invalid() { return; } // OBJID_WINDOW
+    let parent = WATCH_PARENT.load(Ordering::Acquire);
+    let canvas = WATCH_CANVAS.load(Ordering::Acquire);
+    if parent == 0 || canvas == 0 { return; }
+    let parent = HWND(parent as *mut _);
+    let touches_desktop = hwnd == parent
+        || windows::Win32::UI::WindowsAndMessaging::GetParent(hwnd).is_ok_and(|p| p == parent);
+    if !touches_desktop { return; }
+    let host = DesktopHost { parent, insert_after: Some(HWND(WATCH_ICONS.load(Ordering::Acquire) as *mut _)), layered: true };
+    let canvas = HWND(canvas as *mut _);
+    if !is_stacked_correctly(canvas, &host) {
+        let mut parent_rect = RECT::default();
+        let _ = GetClientRect(parent, &mut parent_rect);
+        place(canvas, &host, &parent_rect);
+        crate::log_debug!("Lienzo: el Explorador puso su capa encima; recolocado al instante.");
+    }
+}
 /// Toca comprobar el orden de las capas (temporizador de la ventana del lienzo).
 static CHECK_STACKING: AtomicBool = AtomicBool::new(false);
 const STACKING_TIMER_ID: usize = 1;
@@ -477,6 +621,29 @@ unsafe fn is_stacked_correctly(hwnd: HWND, host: &DesktopHost) -> bool {
 }
 
 impl CanvasWindow {
+    /// Escucha al Explorador para recolocar el lienzo en cuanto ponga algo encima.
+    fn watch_desktop(&mut self) {
+        use windows::Win32::UI::Accessibility::SetWinEventHook;
+        use windows::Win32::UI::WindowsAndMessaging::{GetWindowThreadProcessId, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS};
+        let Some(icons) = self.host.insert_after.filter(|_| self.host.layered) else { return; };
+        unsafe {
+            let mut explorer = 0u32;
+            GetWindowThreadProcessId(self.host.parent, Some(&mut explorer));
+            if explorer == 0 { return; }
+            WATCH_CANVAS.store(self.hwnd.0 as isize, Ordering::Release);
+            WATCH_PARENT.store(self.host.parent.0 as isize, Ordering::Release);
+            WATCH_ICONS.store(icons.0 as isize, Ordering::Release);
+            // EVENT_OBJECT_CREATE (0x8000) .. EVENT_OBJECT_REORDER (0x8004): crear, destruir, mostrar, ocultar, reordenar.
+            let hook = SetWinEventHook(0x8000, 0x8004, None, Some(desktop_event), explorer, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+            if hook.is_invalid() {
+                log_warn!("Lienzo: no se pudo vigilar el escritorio; solo se comprobará cada segundo.");
+                WATCH_CANVAS.store(0, Ordering::Release);
+            } else {
+                self.hook = Some(hook);
+            }
+        }
+    }
+
     fn restack(&self) {
         unsafe {
             let mut parent_rect = RECT::default();
@@ -518,9 +685,6 @@ impl CanvasWindow {
                 0, 0, parent_rect.right, parent_rect.bottom,
                 None, None, hinstance, None,
             ).map_err(|e| format!("no se pudo crear la ventana del lienzo: {e}"))?;
-            if host.layered {
-                let _ = SetLayeredWindowAttributes(hwnd, windows::Win32::Foundation::COLORREF(0), 255, LWA_ALPHA);
-            }
             trace!("ventana creada {:?}", hwnd);
             if SetParent(hwnd, host.parent).is_err() {
                 let _ = DestroyWindow(hwnd);
@@ -546,7 +710,15 @@ impl CanvasWindow {
                 virtual_area: Area::default(),
                 shown: false,
                 decoder,
+                hook: None,
+                paused: false,
+                covered: None,
+                pause_checked: None,
+                clock: None,
+                clock_painter: None,
+                clock_key: 0,
             };
+            canvas.watch_desktop();
             canvas.layout_slots();
             trace!("{} huecos; creando destino D2D", canvas.slots.len());
             canvas.create_target().map_err(|e| format!("no se pudo crear el destino Direct2D: {e}"))?;
@@ -604,7 +776,13 @@ impl CanvasWindow {
             // Sin opciones: EndDraw espera al refresco de pantalla (animación sin saltos).
             presentOptions: D2D1_PRESENT_OPTIONS_NONE,
         };
-        let target = self.factory.CreateHwndRenderTarget(&properties, &hwnd_properties)?;
+        if self.host.layered {
+            // Tiene que ir después de meter la ventana en el escritorio (SetParent): si se llama
+            // antes, Windows no muestra lo que se dibuja hasta que algo recoloca la ventana, y
+            // las transiciones no se ven (solo aparecía la imagen final).
+            let _ = SetLayeredWindowAttributes(self.hwnd, windows::Win32::Foundation::COLORREF(0), 255, LWA_ALPHA);
+        }
+        let target: ID2D1RenderTarget = self.factory.CreateHwndRenderTarget(&properties, &hwnd_properties)?.into();
         self.layer = target.CreateLayer(None).ok();
         self.target = Some(target);
         Ok(())
@@ -617,6 +795,15 @@ impl CanvasWindow {
             let animating = self.is_animating();
             unsafe {
                 if animating {
+                    for _ in 0..MAX_MESSAGES_PER_TURN {
+                        if !PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() { break; }
+                        if msg.message == WM_QUIT { return self.close(); }
+                        self.dispatch(&msg);
+                    }
+                } else if let Some(wait) = self.next_wake() {
+                    // Fondo animado: se duerme hasta el siguiente fotograma o el próximo mensaje.
+                    use windows::Win32::UI::WindowsAndMessaging::{MsgWaitForMultipleObjectsEx, MWMO_INPUTAVAILABLE, QS_ALLINPUT};
+                    let _ = MsgWaitForMultipleObjectsEx(None, wait.as_millis() as u32, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
                     for _ in 0..MAX_MESSAGES_PER_TURN {
                         if !PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() { break; }
                         if msg.message == WM_QUIT { return self.close(); }
@@ -635,7 +822,7 @@ impl CanvasWindow {
                 if !windows::Win32::UI::WindowsAndMessaging::IsWindow(self.hwnd).as_bool() {
                     // El Explorador se reinició y se llevó la ventana consigo.
                     log_warn!("Lienzo: la ventana desapareció (¿se reinició el Explorador?).");
-                    return;
+                    return self.close();
                 }
             }
             if CHECK_STACKING.swap(false, Ordering::AcqRel) {
@@ -652,7 +839,28 @@ impl CanvasWindow {
                         self.show(frame);
                         dirty = true;
                     }
+                    Command::Animate(frames) => {
+                        self.animate(frames);
+                        dirty = true;
+                    }
+                    Command::Clock(clock) => {
+                        if clock.is_some() && self.clock_painter.is_none() {
+                            self.clock_painter = clock::ClockPainter::new(&self.factory);
+                        }
+                        if clock.is_none() {
+                            self.clock_painter = None;
+                        }
+                        self.clock = clock;
+                        self.clock_key = 0;
+                        dirty = true;
+                    }
                 }
+            }
+            if self.advance_animations() {
+                dirty = true;
+            }
+            if self.clock_due() {
+                dirty = true;
             }
             if dirty || self.is_animating() {
                 let started = Instant::now();
@@ -707,8 +915,8 @@ impl CanvasWindow {
             }
         };
         drop(frame.pixels);
-        let layer = Layer { bitmap, size: (frame.width as f32, frame.height as f32), fit: frame.fit, path: frame.path };
         let now = Instant::now();
+        let layer = Layer { bitmap, size: (frame.width as f32, frame.height as f32), fit: frame.fit, path: frame.path, playback: None, luma: frame.luma };
         let overlap = |a: &RECT, b: &RECT| {
             let w = (a.right.min(b.right) - a.left.max(b.left)).max(0) as i64;
             let h = (a.bottom.min(b.bottom) - a.top.max(b.top)).max(0) as i64;
@@ -739,6 +947,9 @@ impl CanvasWindow {
     fn render(&mut self) {
         let Some(target) = self.target.clone() else { return; };
         let now = Instant::now();
+        let clock_now = clock::LocalTime::now();
+        self.clock_key = Self::clock_key_of(self.clock.as_ref(), clock_now);
+        let mut clock_painter = self.clock_painter.take();
         unsafe {
             target.BeginDraw();
             target.Clear(Some(&D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 1.0 }));
@@ -753,18 +964,36 @@ impl CanvasWindow {
                     (None, Some(current)) => self.draw_layer(&target, current, slot.area, Placement::default()),
                     _ => {}
                 }
+                if let (Some(settings), Some(painter)) = (self.clock.as_ref(), clock_painter.as_mut()) {
+                    let main = slot.screen.left == 0 && slot.screen.top == 0;
+                    if !settings.main_monitor_only || main {
+                        let luma = slot.current.as_ref().map(|layer| layer.luma[clock::region(settings.position)]).unwrap_or(0.0);
+                        painter.draw(&target, &self.factory, slot.area, settings, luma, clock_now);
+                    }
+                }
                 target.PopAxisAlignedClip();
             }
             match target.EndDraw(None, None) {
-                Ok(()) => {}
+                Ok(()) => {
+                    if self.host.layered {
+                        // Escritorio 24H2+: sin esto Windows a veces sigue mostrando una copia
+                        // anterior de la ventana "layered" y la transición salta entre la imagen
+                        // vieja y la nueva (o no se ve). Reafirmar los atributos en cada fotograma
+                        // le obliga a componer el fotograma recién dibujado. Medido en pantalla:
+                        // fundido continuo, sin saltos.
+                        let _ = SetLayeredWindowAttributes(self.hwnd, windows::Win32::Foundation::COLORREF(0), 255, LWA_ALPHA);
+                    }
+                }
                 Err(e) if e.code().0 == D2DERR_RECREATE_TARGET => {
                     log_warn!("Lienzo: dispositivo gráfico perdido, se recrea.");
+                    self.clock_painter = clock_painter;
                     self.recover_device();
                     return;
                 }
                 Err(e) => log_warn!("Lienzo: error al dibujar: {e}"),
             }
         }
+        self.clock_painter = clock_painter;
         // Las transiciones terminadas sueltan la imagen anterior (memoria de GPU).
         let mut released = false;
         for slot in self.slots.iter_mut() {
@@ -780,6 +1009,150 @@ impl CanvasWindow {
             self.shown = true;
             unsafe { let _ = ShowWindow(self.hwnd, SW_SHOWNA); }
         }
+    }
+
+    /// Llegaron los fotogramas de un fondo animado: sustituyen a su primer fotograma en los
+    /// monitores que lo muestran (si mientras tanto se puso otra imagen, se descartan).
+    fn animate(&mut self, frames: AnimFrames) {
+        let Some(target) = self.target.clone() else { return; };
+        let properties = D2D1_BITMAP_PROPERTIES {
+            pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED },
+            dpiX: 96.0,
+            dpiY: 96.0,
+        };
+        let stride = frames.width * 4;
+        let bitmap = unsafe {
+            target.CreateBitmap(D2D_SIZE_U { width: frames.width, height: frames.height }, Some(frames.frames[0].as_ptr() as *const _), stride, &properties)
+        };
+        let Ok(bitmap) = bitmap else { return; };
+        let first = frames.delays.first().copied().unwrap_or(Duration::from_millis(100));
+        let playback = Rc::new(Playback {
+            bitmap: bitmap.clone(), frames: frames.frames, delays: frames.delays, stride, index: Cell::new(0), due: Cell::new(Instant::now() + first),
+        });
+        let layer = Layer { bitmap, size: (frames.width as f32, frames.height as f32), fit: frames.fit, path: frames.path, playback: Some(playback), luma: frames.luma };
+        let overlaps = |a: &RECT, b: &RECT| a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom;
+        for slot in self.slots.iter_mut() {
+            if let Target::Monitor(rect) = frames.target {
+                if !overlaps(&slot.screen, &rect) { continue; }
+            }
+            if slot.current.as_ref().is_some_and(|current| current.path == layer.path && current.playback.is_none()) {
+                slot.current = Some(layer.clone());
+            }
+        }
+    }
+
+    /// Animaciones a la vista (una por imagen, aunque se vea en varios monitores) y las
+    /// pantallas en que se ven.
+    fn playbacks(&self) -> Vec<(Rc<Playback>, Vec<RECT>)> {
+        let mut found: Vec<(Rc<Playback>, Vec<RECT>)> = Vec::new();
+        for slot in &self.slots {
+            let Some(playback) = slot.current.as_ref().and_then(|layer| layer.playback.clone()) else { continue; };
+            match found.iter_mut().find(|(known, _)| Rc::ptr_eq(known, &playback)) {
+                Some((_, screens)) => screens.push(slot.screen),
+                None => found.push((playback, vec![slot.screen])),
+            }
+        }
+        found
+    }
+
+    fn refresh_pause(&mut self, now: Instant) {
+        if self.pause_checked.is_some_and(|checked| now.duration_since(checked) < PAUSE_CHECK) { return; }
+        self.pause_checked = Some(now);
+        let reason = anim::pause_reason();
+        let paused = reason.is_some();
+        if paused != self.paused {
+            match reason {
+                Some(reason) => log_info!("Lienzo: animación en pausa ({reason})"),
+                None => log_info!("Lienzo: animación reanudada"),
+            }
+        }
+        self.paused = paused;
+        self.covered = anim::covered_monitor();
+    }
+
+    /// Cuánto falta para el siguiente fotograma de alguna animación (None si no hay ninguna).
+    fn next_frame_in(&self) -> Option<Duration> {
+        let playbacks = self.playbacks();
+        if playbacks.is_empty() { return None; }
+        let now = Instant::now();
+        let next = playbacks.iter()
+            .filter(|(_, screens)| !self.is_paused(screens))
+            .map(|(playback, _)| playback.due.get().saturating_duration_since(now))
+            .min()
+            .unwrap_or(PAUSE_CHECK);
+        // Aunque esté en pausa, se vuelve a mirar cada poco por si hay que reanudar.
+        Some(next.min(PAUSE_CHECK))
+    }
+
+    /// Lo que cambia en el reloj dibujado: el minuto, o el segundo si se muestran.
+    fn clock_key_of(settings: Option<&crate::config::ClockConfig>, t: clock::LocalTime) -> u64 {
+        let Some(settings) = settings else { return 0; };
+        let minute = ((t.month as u64 * 32 + t.day as u64) * 24 + t.hour as u64) * 60 + t.minute as u64;
+        if clock::ticks_every_second(settings) { minute * 60 + t.second as u64 + 1 } else { minute + 1 }
+    }
+
+    /// Cuánto falta para que cambie lo que muestra el reloj.
+    fn clock_wait(&self) -> Option<Duration> {
+        let settings = self.clock.as_ref()?;
+        let t = clock::LocalTime::now();
+        let millis = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() }.wMilliseconds as u64;
+        let wait = if clock::ticks_every_second(settings) {
+            1000 - millis.min(999)
+        } else {
+            (60 - t.second as u64).max(1) * 1000 - millis.min(999)
+        };
+        // Un poco después del cambio, para no despertar justo antes.
+        Some(Duration::from_millis(wait + 15))
+    }
+
+    /// Lo próximo que hay que hacer sin mensajes: un fotograma de animación o el reloj.
+    fn next_wake(&self) -> Option<Duration> {
+        match (self.next_frame_in(), self.clock_wait()) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    /// ¿Cambió la hora que muestra el reloj? No se repinta con el escritorio tapado
+    /// (pantalla completa, sesión bloqueada, ahorro de batería).
+    fn clock_due(&mut self) -> bool {
+        if self.clock.is_none() { return false; }
+        let key = Self::clock_key_of(self.clock.as_ref(), clock::LocalTime::now());
+        if key == self.clock_key { return false; }
+        anim::pause_reason().is_none()
+    }
+
+    fn is_paused(&self, screens: &[RECT]) -> bool {
+        self.paused || screens.iter().all(|screen| self.covered.is_some_and(|covered| covered == *screen))
+    }
+
+    /// Pasa de fotograma las animaciones a las que les toca. Devuelve si hay que repintar.
+    fn advance_animations(&mut self) -> bool {
+        let playbacks = self.playbacks();
+        if playbacks.is_empty() { return false; }
+        let now = Instant::now();
+        self.refresh_pause(now);
+        let mut dirty = false;
+        for (playback, screens) in playbacks {
+            if self.is_paused(&screens) {
+                // Al reanudar sigue desde aquí, sin correr para recuperar el tiempo perdido.
+                playback.due.set(now + PAUSE_CHECK);
+                continue;
+            }
+            if now < playback.due.get() { continue; }
+            let index = (playback.index.get() + 1) % playback.frames.len();
+            playback.index.set(index);
+            let pixels = &playback.frames[index];
+            if unsafe { playback.bitmap.CopyFromMemory(None, pixels.as_ptr() as *const _, playback.stride) }.is_err() {
+                continue;
+            }
+            let mut due = playback.due.get() + playback.delays[index];
+            // Si se quedó atrás (equipo ocupado), no intenta ponerse al día de golpe.
+            if due < now { due = now + playback.delays[index]; }
+            playback.due.set(due);
+            dirty = true;
+        }
+        dirty
     }
 
     /// Al quedar quieto, devuelve al sistema la memoria que Direct2D y el driver guardan en caché
@@ -802,7 +1175,7 @@ impl CanvasWindow {
         trace!("memoria de la GPU recortada");
     }
 
-    unsafe fn draw_layer(&self, target: &ID2D1HwndRenderTarget, layer: &Layer, area: Area, placement: Placement) {
+    unsafe fn draw_layer(&self, target: &ID2D1RenderTarget, layer: &Layer, area: Area, placement: Placement) {
         let (cx, cy) = ((area.left + area.right) / 2.0, (area.top + area.bottom) / 2.0);
         for rect in layout_rects(layer.fit, layer.size, area, self.virtual_area) {
             // Escala alrededor del centro del monitor y desplazamiento horizontal.
@@ -817,7 +1190,7 @@ impl CanvasWindow {
     }
 
     /// Un fotograma de la transición de `previous` a `current` (`t` va de 0 a 1, ya suavizado).
-    unsafe fn draw_transition(&self, target: &ID2D1HwndRenderTarget, slot: &Slot, previous: &Layer, current: &Layer, t: f32) {
+    unsafe fn draw_transition(&self, target: &ID2D1RenderTarget, slot: &Slot, previous: &Layer, current: &Layer, t: f32) {
         let area = slot.area;
         let still = Placement::default();
         match slot.effect {
@@ -889,13 +1262,18 @@ impl CanvasWindow {
         for (path, (screens, fit)) in pending {
             for screen in screens {
                 let size = ((screen.right - screen.left).max(1) as u32, (screen.bottom - screen.top).max(1) as u32);
-                let _ = self.decoder.send(DecodeJob { path: path.clone(), target: Target::Monitor(screen), fit, duration: Duration::ZERO, effect: Transition::Fade, area_size: size });
+                send_job(&self.decoder, DecodeJob { path: path.clone(), target: Target::Monitor(screen), fit, duration: Duration::ZERO, effect: Transition::Fade, area_size: size });
             }
         }
     }
 
     fn close(&mut self) {
         CANVAS_THREAD.store(0, Ordering::Release);
+        WATCH_CANVAS.store(0, Ordering::Release);
+        WATCH_PARENT.store(0, Ordering::Release);
+        if let Some(hook) = self.hook.take() {
+            unsafe { let _ = windows::Win32::UI::Accessibility::UnhookWinEvent(hook); }
+        }
         self.slots.clear();
         self.layer = None;
         self.target = None;

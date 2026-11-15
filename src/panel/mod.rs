@@ -1,7 +1,10 @@
 mod carousel;
+pub(crate) mod d2d;
+mod gallery;
+mod notch;
 
 use crate::app;
-use crate::config::{PanelMode, PanelSide, ProPriority};
+use crate::config::{PanelMode, PanelSide, ProPriority, ProStyle};
 use crate::log_info;
 use crate::scanner::ScannedImage;
 use crate::thumbs::ThumbnailCache;
@@ -36,13 +39,14 @@ const BASE_CORNER_RADIUS: i32 = 8;
 const BASE_CLOSE_GRACE: i32 = 12;
 
 // Paleta del panel (COLORREF en formato 0x00BBGGRR).
-const COLOR_BACKGROUND: COLORREF = COLORREF(0x00181818);
-const COLOR_PLACEHOLDER: COLORREF = COLORREF(0x00303030);
-const COLOR_SCROLL_TRACK: COLORREF = COLORREF(0x00404040);
-const COLOR_SCROLL_THUMB: COLORREF = COLORREF(0x00FFFFFF);
-const COLOR_TEXT: COLORREF = COLORREF(0x00D0D0D0);
+fn pick(dark: u32, light: u32) -> COLORREF { COLORREF(if crate::winutil::light_theme() { light } else { dark }) }
+fn color_background() -> COLORREF { pick(0x00181818, 0x00F3F3F3) }
+fn color_placeholder() -> COLORREF { pick(0x00303030, 0x00DADADA) }
+fn color_scroll_track() -> COLORREF { pick(0x00404040, 0x00D4D4D4) }
+fn color_scroll_thumb() -> COLORREF { pick(0x00FFFFFF, 0x00505050) }
+fn color_text() -> COLORREF { pick(0x00D0D0D0, 0x00303030) }
 /// Miniatura con el foco (ratón o teclado).
-const COLOR_FOCUS: COLORREF = COLORREF(0x00FFFFFF);
+fn color_focus() -> COLORREF { pick(0x00FFFFFF, 0x00202020) }
 /// Fondo de pantalla aplicado ahora (azul acento).
 const COLOR_CURRENT: COLORREF = COLORREF(0x00FFC24C);
 /// Punto de las imágenes recién descubiertas (verde).
@@ -140,6 +144,7 @@ struct PanelVars {
     menu_open: Cell<bool>,
     side: Cell<PanelSide>,
     mode: Cell<PanelMode>,
+    pro_style: Cell<ProStyle>,
     show_scrollbar: Cell<bool>,
     margin: Cell<u32>,
     width: Cell<i32>,
@@ -184,6 +189,7 @@ impl Default for PanelVars {
             menu_open: Cell::new(false),
             side: Cell::new(PanelSide::Top),
             mode: Cell::new(PanelMode::LowPower),
+            pro_style: Cell::new(ProStyle::Showcase),
             show_scrollbar: Cell::new(true),
             margin: Cell::new(0),
             width: Cell::new(800),
@@ -386,14 +392,14 @@ unsafe fn draw_empty_state(dc: HDC, width: i32, height: i32) {
     let box_w = px(420).min(width);
     let box_h = px(64).min(height);
     let mut rect = RECT { left: (width - box_w) / 2, top: (height - box_h) / 2, right: (width + box_w) / 2, bottom: (height + box_h) / 2 };
-    let bg = CreateSolidBrush(COLOR_BACKGROUND);
+    let bg = CreateSolidBrush(color_background());
     let _ = FillRect(dc, &rect, bg);
     let _ = DeleteObject(bg);
     let face = to_wide_chars("Segoe UI");
     let font = CreateFontW(-px(15), 0, 0, 0, FW_NORMAL.0 as i32, 0, 0, 0, Default::default(), Default::default(), Default::default(), Default::default(), 0, as_pcwstr(&face));
     let old_font = SelectObject(dc, font);
     let _ = SetBkMode(dc, TRANSPARENT);
-    let _ = SetTextColor(dc, COLOR_TEXT);
+    let _ = SetTextColor(dc, color_text());
     let mut text: Vec<u16> = crate::i18n::t("No wallpapers found in the folder").encode_utf16().collect();
     let flags = if vertical_text_wrap(width) { DT_CENTER | DT_WORDBREAK } else { DT_CENTER | DT_VCENTER | DT_SINGLELINE };
     let _ = DrawTextW(dc, &mut text, &mut rect, flags);
@@ -623,7 +629,7 @@ pub fn set_thumbnail_loading(on_demand: bool, size_px: i32) {
 }
 
 unsafe fn paint_contents(dc: HDC, hwnd: HWND, width: i32, height: i32) {
-    let bg = CreateSolidBrush(COLOR_BACKGROUND);
+    let bg = CreateSolidBrush(color_background());
     let _ = FillRect(dc, &RECT { left: 0, top: 0, right: width, bottom: height }, bg);
     let _ = DeleteObject(bg);
 
@@ -691,7 +697,7 @@ unsafe fn paint_contents(dc: HDC, hwnd: HWND, width: i32, height: i32) {
                     let _ = StretchBlt(dc, draw_x, draw_y, draw_w, draw_h, bmp_dc, src_x, src_y, src_w, src_h, SRCCOPY);
                     SelectObject(bmp_dc, old);
                 } else {
-                    let ph = CreateSolidBrush(COLOR_PLACEHOLDER);
+                    let ph = CreateSolidBrush(color_placeholder());
                     let r = RECT { left: draw_x, top: draw_y, right: draw_x + draw_w, bottom: draw_y + draw_h };
                     let _ = FillRect(dc, &r, ph);
                     let _ = DeleteObject(ph);
@@ -699,7 +705,7 @@ unsafe fn paint_contents(dc: HDC, hwnd: HWND, width: i32, height: i32) {
                 let _ = SelectClipRgn(dc, windows::Win32::Graphics::Gdi::HRGN(std::ptr::null_mut()));
                 let is_current = current_wp.as_ref().is_some_and(|p| same_path(p, &img.path));
                 let frame = if focus == Some(idx) {
-                    Some(COLOR_FOCUS)
+                    Some(color_focus())
                 } else if is_current {
                     Some(COLOR_CURRENT)
                 } else {
@@ -726,8 +732,8 @@ unsafe fn paint_contents(dc: HDC, hwnd: HWND, width: i32, height: i32) {
             let _ = DeleteDC(bmp_dc);
             let total_main = thumbnail_content_extent(images.len(), vertical);
             if vars(|v| v.show_scrollbar.get()) && total_main > viewport {
-                let track_brush = CreateSolidBrush(COLOR_SCROLL_TRACK);
-                let thumb_brush = CreateSolidBrush(COLOR_SCROLL_THUMB);
+                let track_brush = CreateSolidBrush(color_scroll_track());
+                let thumb_brush = CreateSolidBrush(color_scroll_thumb());
                 let max_scroll = (total_main - viewport).max(1);
                 if vertical {
                     let track_x = thumb_margin() + thumb_w() + thumb_margin();
@@ -859,6 +865,7 @@ unsafe extern "system" fn panel_wnd_proc(
                         v.exiting.set(false);
                     });
                     release_backbuffer();
+                    flush_notify();
                     if is_carousel() {
                         let _ = SetTimer(hwnd, TILE_RELEASE_TIMER_ID, TILE_RELEASE_DELAY_MS, None);
                     }
@@ -1139,18 +1146,132 @@ pub fn set_panel_side(side: PanelSide) {
 }
 
 pub fn set_panel_mode(mode: PanelMode) {
-    let old_mode = vars(|v| v.mode.replace(mode));
+    let old_mode = vars(|v| v.mode.get());
     if old_mode == mode { return; }
-    if old_mode == PanelMode::Pro { carousel::clear_tiles(); }
-    reopen_if_visible();
+    // Cerrar con el modo anterior y volver a abrir con el nuevo.
+    let was_visible = is_panel_visible();
+    let close_on_leave = if notch::is_visible() {
+        notch::closes_on_leave()
+    } else if gallery::is_visible() {
+        gallery::closes_on_leave()
+    } else {
+        vars(|v| v.close_on_mouse_leave.get())
+    };
+    if notch::is_visible() { notch::hide_now(); }
+    if gallery::is_visible() { gallery::hide_now(); }
+    if vars(|v| v.visible.get()) {
+        if let Some(hwnd) = vars(|v| v.hwnd.get()) {
+            unsafe {
+                let _ = KillTimer(hwnd, ANIM_TIMER_ID);
+                let _ = KillTimer(hwnd, AUTO_CLOSE_TIMER_ID);
+                let _ = KillTimer(hwnd, HOVER_ANIM_TIMER_ID);
+                let _ = ShowWindow(hwnd, windows::Win32::UI::WindowsAndMessaging::SW_HIDE);
+            }
+        }
+        vars(|v| {
+            v.visible.set(false);
+            v.exiting.set(false);
+            v.slide.set(None);
+            v.animating.set(false);
+        });
+    }
+    vars(|v| v.mode.set(mode));
+    if matches!(old_mode, PanelMode::Pro | PanelMode::Notch) { carousel::clear_tiles(); }
+    if was_visible { show_panel_with_close_on_mouse_leave(close_on_leave); }
 }
 
 pub fn set_pro_priority(priority: ProPriority) {
     carousel::set_smooth_priority(priority == ProPriority::Smooth);
 }
 
+/// Aspecto del modo Pro. Si cambia con el panel abierto, se cierra y se vuelve a abrir.
+pub fn set_pro_style(style: ProStyle) {
+    if vars(|v| v.pro_style.replace(style)) == style || vars(|v| v.mode.get()) != PanelMode::Pro { return; }
+    // Pasar por otro modo cierra lo que esté abierto y lo reabre con el estilo nuevo.
+    vars(|v| v.mode.set(PanelMode::LowPower));
+    set_panel_mode(PanelMode::Pro);
+}
+
+/// ¿Hay que usar la galería Direct2D en lugar del carrusel GDI?
+fn uses_gallery() -> bool {
+    vars(|v| v.mode.get() == PanelMode::Pro && v.pro_style.get() != ProStyle::Classic)
+}
+
+// --- Vista previa en el escritorio ---
+
+thread_local! {
+    static PREVIEW_ENABLED: Cell<bool> = const { Cell::new(false) };
+    /// Imagen que se está viendo en el escritorio sin haberse aplicado.
+    static PREVIEWING: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+}
+
+/// Activa la vista previa (solo tiene sentido con el lienzo).
+/// Mostrar el nombre de los fondos en el notch y las galerías.
+static SHOW_NAMES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+pub fn set_show_names(show: bool) { SHOW_NAMES.store(show, std::sync::atomic::Ordering::Relaxed); }
+
+pub(super) fn show_names() -> bool { SHOW_NAMES.load(std::sync::atomic::Ordering::Relaxed) }
+
+pub fn set_live_preview(enabled: bool) {
+    PREVIEW_ENABLED.with(|e| e.set(enabled));
+    if !enabled { preview_end(); }
+}
+
+/// La vista enfocó otra imagen (y se quedó quieta): enseñarla en el escritorio.
+fn preview_focus(path: Option<PathBuf>, monitor: RECT) {
+    if !PREVIEW_ENABLED.with(|e| e.get()) { return; }
+    let Some(path) = path else { return; };
+    let previewing = PREVIEWING.with(|p| p.borrow().clone());
+    if previewing.as_ref().is_some_and(|p| same_path(p, &path)) { return; }
+    // Volver a la imagen puesta: basta con quitar la vista previa.
+    let current = vars(|v| v.current_wallpaper.borrow().clone());
+    if current.as_ref().is_some_and(|c| same_path(c, &path)) {
+        preview_end();
+        return;
+    }
+    PREVIEWING.with(|p| *p.borrow_mut() = Some(path.clone()));
+    app::request(app::Action::Preview(path, monitor));
+}
+
+/// El panel se cierra: si había vista previa, el escritorio vuelve al fondo puesto
+/// (si se aplicó una imagen, la aplicación ya lo sabe y no hace nada).
+fn preview_end() {
+    if PREVIEWING.with(|p| p.borrow_mut().take()).is_some() {
+        app::request(app::Action::EndPreview);
+    }
+}
+
+/// Aviso del notch al cambiar de fondo sin abrir el panel.
+pub fn notify_wallpaper(path: &Path) {
+    // Con un panel abierto o cerrándose, el aviso espera a que termine de irse.
+    let busy = vars(|v| v.visible.get()) || (notch::is_visible() && !notch::is_notifying()) || gallery::is_visible();
+    if busy {
+        PENDING_NOTIFY.with(|p| *p.borrow_mut() = Some((path.to_path_buf(), std::time::Instant::now())));
+        return;
+    }
+    notch::notify(path);
+}
+
+thread_local! {
+    /// Aviso de cambio de fondo a la espera de que se cierre el panel (con la hora en que se pidió).
+    static PENDING_NOTIFY: RefCell<Option<(PathBuf, std::time::Instant)>> = const { RefCell::new(None) };
+}
+
+/// Un panel terminó de cerrarse: mostrar el aviso pendiente si es reciente.
+pub(super) fn flush_notify() {
+    let Some((path, asked)) = PENDING_NOTIFY.with(|p| p.borrow_mut().take()) else { return; };
+    if asked.elapsed() < std::time::Duration::from_secs(3) {
+        notify_wallpaper(&path);
+    }
+}
+
 /// Vuelve a mostrar el panel con la nueva disposición si estaba abierto.
 fn reopen_if_visible() {
+    if notch::is_visible() || gallery::is_visible() {
+        // El notch no depende del lado: no hace falta reabrirlo.
+        return;
+    }
     if is_panel_visible() {
         let close_on_leave = vars(|v| v.close_on_mouse_leave.get());
         if let Some(hwnd) = vars(|v| v.hwnd.get()) {
@@ -1192,6 +1313,16 @@ pub fn set_panel_margin(margin: u32) {
 }
 
 fn show_panel_with_close_on_mouse_leave(close_on_mouse_leave: bool) {
+    if vars(|v| v.mode.get()) == PanelMode::Notch {
+        notch::show(close_on_mouse_leave);
+        return;
+    }
+    if uses_gallery() {
+        // Un aviso del notch en curso se quita para no tapar la galería.
+        notch::hide_now();
+        gallery::show(vars(|v| v.pro_style.get()), close_on_mouse_leave);
+        return;
+    }
     unsafe {
         if vars(|v| v.visible.get()) { return; }
         // El carrusel queda lejos del borde: solo se cierra con clic fuera, Esc o al elegir.
@@ -1353,6 +1484,14 @@ fn show_panel_with_close_on_mouse_leave(close_on_mouse_leave: bool) {
 }
 
 pub fn hide_panel() {
+    if gallery::is_visible() {
+        gallery::hide();
+        return;
+    }
+    if notch::is_visible() {
+        notch::hide();
+        return;
+    }
     unsafe {
         if !vars(|v| v.visible.get()) || vars(|v| v.exiting.get()) { return; }
         let Some(hwnd) = vars(|v| v.hwnd.get()) else { return; };
@@ -1412,6 +1551,8 @@ pub fn set_current_wallpaper(path: &Path) {
 }
 
 pub fn request_repaint() {
+    notch::request_render();
+    gallery::request_render();
     if let Some(hwnd) = vars(|v| v.hwnd.get()) {
         unsafe {
             let _ = windows::Win32::Graphics::Gdi::InvalidateRect(hwnd, None, true);
@@ -1421,6 +1562,8 @@ pub fn request_repaint() {
 
 pub fn is_panel_visible() -> bool {
     vars(|v| v.visible.get())
+        || (notch::is_visible() && !notch::is_closing() && !notch::is_notifying())
+        || (gallery::is_visible() && !gallery::is_closing())
 }
 
 #[cfg(test)]
@@ -1498,6 +1641,7 @@ mod tests {
     #[test]
     #[ignore]
     fn render_strip_preview() {
+        if std::env::var("SWEPR_TEST_LIGHT").is_ok() { crate::winutil::set_theme(2); }
         let dir = std::env::var("SWEPR_TEST_DIR").expect("SWEPR_TEST_DIR");
         let out = std::env::var("SWEPR_TEST_OUT").expect("SWEPR_TEST_OUT");
         let mut paths: Vec<PathBuf> = std::fs::read_dir(dir).unwrap().flatten().map(|e| e.path())

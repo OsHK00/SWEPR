@@ -325,6 +325,31 @@ fn evict(capacity: usize) {
     }
 }
 
+/// Pide (con prioridad para las primeras) las tarjetas de estas imágenes al tamaño del diseño actual.
+/// Lo usa el notch, que comparte la caché y el hilo de carga del carrusel.
+pub fn request_tiles(images: &[ScannedImage], wanted: Vec<usize>, notify: HWND) {
+    if let Some(layout) = layout() { request_missing(images, wanted, &layout, notify); }
+}
+
+/// Tarjeta ya generada de esta imagen, si la hay. Llamar desde el hilo de interfaz.
+pub fn tile(key: &str) -> Option<Thumb> {
+    TILES.lock().ok().and_then(|cache| cache.as_ref().and_then(|c| c.tiles.get(key).map(|(thumb, _)| thumb.clone())))
+}
+
+/// Marca estas tarjetas como usadas y deja en memoria como mucho `capacity`.
+pub fn keep_tiles<'a>(keys: impl Iterator<Item = &'a str>, capacity: usize) {
+    if let Ok(mut guard) = TILES.lock() {
+        if let Some(cache) = guard.as_mut() {
+            cache.tick += 1;
+            let tick = cache.tick;
+            for key in keys {
+                if let Some(entry) = cache.tiles.get_mut(key) { entry.1 = tick; }
+            }
+        }
+    }
+    evict(capacity);
+}
+
 // --- Pintado ---
 
 pub struct PaintInput<'a> {
@@ -422,7 +447,7 @@ pub unsafe fn paint(dc: HDC, width: i32, height: i32, input: &PaintInput) -> Opt
             let _ = StretchBlt(dc, rect.left, rect.top, dest_w, dest_h, src_dc, crop_x, crop_y, crop_w, crop_h, SRCCOPY);
             SelectObject(src_dc, old);
         } else {
-            let placeholder = CreateSolidBrush(super::COLOR_PLACEHOLDER);
+            let placeholder = CreateSolidBrush(super::color_placeholder());
             let _ = FillRect(dc, &rect, placeholder);
             let _ = DeleteObject(placeholder);
         }
@@ -437,7 +462,7 @@ pub unsafe fn paint(dc: HDC, width: i32, height: i32, input: &PaintInput) -> Opt
 
         let is_current = input.current.is_some_and(|p| crate::winutil::same_path(p, &img.path));
         let frame = if input.focus == Some(index) && focus_amount > 0.5 {
-            Some(super::COLOR_FOCUS)
+            Some(super::color_focus())
         } else if is_current {
             Some(super::COLOR_CURRENT)
         } else {

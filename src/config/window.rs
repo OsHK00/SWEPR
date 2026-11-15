@@ -1,11 +1,10 @@
-use crate::config::{AppConfig, ApplyMode, FitMode, Transition, PanelMode, PanelSide, ProPriority, SortOrder, ThumbLoading};
+use crate::config::{AppConfig, ApplyMode, ClockPosition, ClockSize, ClockStyle, FitMode, Transition, PanelMode, PanelSide, ProPriority, ProStyle, SortOrder, Theme, ThumbLoading};
 use crate::log_info;
 use crate::winutil::{as_pcwstr, to_wide_chars};
 use std::sync::{Arc, Mutex};
-use windows::Win32::Foundation::{BOOL, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::Graphics::Gdi::{FillRect, HDC, SetBkColor, SetBkMode, SetTextColor, OPAQUE, TRANSPARENT};
-use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassW,
     CS_HREDRAW, CS_VREDRAW, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WS_CAPTION, WS_CLIPCHILDREN, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU,
@@ -45,6 +44,24 @@ const IDC_SHUFFLE_CHK: i32 = 1031;
 const IDC_FAVORITES_ONLY_CHK: i32 = 1032;
 const IDC_PER_MONITOR_CHK: i32 = 1033;
 const IDC_HIDDEN_BTN: i32 = 1034;
+const IDC_PRO_STYLE_COMBO: i32 = 1037;
+const IDC_NOTCH_NOTIFY_CHK: i32 = 1038;
+const IDC_LIVE_PREVIEW_CHK: i32 = 1039;
+const IDC_THEME_COMBO: i32 = 1040;
+const IDC_SHOW_NAMES_CHK: i32 = 1041;
+const IDC_ANIMATED_CHK: i32 = 1042;
+const IDC_CLOCK_CHK: i32 = 1043;
+const IDC_CLOCK_STYLE_COMBO: i32 = 1044;
+const IDC_CLOCK_POSITION_COMBO: i32 = 1045;
+const IDC_CLOCK_SIZE_COMBO: i32 = 1046;
+const IDC_CLOCK_24H_CHK: i32 = 1047;
+const IDC_CLOCK_SECONDS_CHK: i32 = 1048;
+const IDC_CLOCK_DATE_CHK: i32 = 1049;
+const IDC_CLOCK_MAIN_CHK: i32 = 1050;
+/// Controles del reloj que dependen de tenerlo activado.
+const CLOCK_OPTIONS: [i32; 7] = [
+    IDC_CLOCK_STYLE_COMBO, IDC_CLOCK_POSITION_COMBO, IDC_CLOCK_SIZE_COMBO, IDC_CLOCK_24H_CHK, IDC_CLOCK_SECONDS_CHK, IDC_CLOCK_DATE_CHK, IDC_CLOCK_MAIN_CHK,
+];
 
 /// Mensaje propio: el hilo del diálogo "Examinar" terminó (con o sin carpeta elegida).
 const WM_APP_FOLDER_PICKED: u32 = windows::Win32::UI::WindowsAndMessaging::WM_USER + 100;
@@ -116,22 +133,25 @@ unsafe fn add_control(hwnd: HWND, class: &str, text: &[u16], id: i32, x: i32, y:
 }
 
 /// Tarjetas de la ventana (título, x, y, ancho, alto) en píxeles a 96 DPI.
-const SECTIONS: [(&str, i32, i32, i32, i32); 5] = [
-    ("Wallpaper folder:", 12, 12, 920, 86),
-    ("Thumbnail panel", 12, 110, 620, 242),
-    ("General", 12, 374, 620, 146),
-    ("Wallpaper", 644, 110, 288, 410),
-    ("Keyboard shortcuts", 12, 532, 920, 106),
+/// Las de cada columna empiezan y acaban a la misma altura.
+const SECTIONS: [(&str, i32, i32, i32, i32); 6] = [
+    ("Wallpaper folder:", 12, 12, 1220, 86),
+    ("Thumbnail panel", 12, 110, 620, 304),
+    ("General", 12, 426, 620, 178),
+    ("Wallpaper", 644, 110, 288, 494),
+    ("Desktop clock", 944, 110, 288, 494),
+    ("Keyboard shortcuts", 12, 616, 1220, 106),
 ];
 /// Marco del campo de la carpeta (el EDIT va dentro, sin borde propio).
-const FOLDER_FIELD: (i32, i32, i32, i32) = (28, 52, 756, 32);
-const CLIENT_W: i32 = 944;
-const CLIENT_H: i32 = 698;
+const FOLDER_FIELD: (i32, i32, i32, i32) = (28, 52, 1056, 32);
+const CLIENT_W: i32 = 1244;
+const CLIENT_H: i32 = 782;
 const COL_1: i32 = 28;
 const COL_2: i32 = 334;
 const COL_3: i32 = 660;
 const COL_W: i32 = 282;
 const COL_3_W: i32 = 256;
+const COL_4: i32 = 960;
 const THUMB_SIZES: [u32; 4] = [64, 128, 256, 512];
 /// Intervalos de rotación automática en minutos (0 = desactivada).
 const ROTATION_MINUTES: [u32; 8] = [0, 5, 15, 30, 60, 180, 720, 1440];
@@ -162,33 +182,42 @@ unsafe fn create_config_controls(hwnd: HWND) {
     // Carpeta
     let (fx, fy, fw, fh) = FOLDER_FIELD;
     add_control(hwnd, "EDIT", &to_wide_chars(""), IDC_FOLDER_EDIT, fx + 10, fy + (fh - 18) / 2, fw - 20, 18, TAB_STOP | AUTO_HORIZONTAL_SCROLL);
-    style_button(add_control(hwnd, "BUTTON", &tr("Browse..."), IDC_FOLDER_BTN, 794, fy, 122, fh, TAB_STOP), false, true);
+    style_button(add_control(hwnd, "BUTTON", &tr("Browse..."), IDC_FOLDER_BTN, 1094, fy, 122, fh, TAB_STOP), false, true);
 
     // Panel de miniaturas
+    // Izquierda: el panel y su posición; derecha: lo propio del modo Pro.
     label(tr("Panel mode:"), COL_1, 150, COL_W);
-    add_combo(IDC_PANEL_MODE_COMBO, COL_1, 170, COL_W, &[tr("Low power"), tr("Pro (carousel)")]);
-    label(tr("Thumbnail panel position:"), COL_2, 150, COL_W);
-    add_combo(IDC_PANEL_SIDE_COMBO, COL_2, 170, COL_W, &[tr("Top"), tr("Left"), tr("Right")]);
-    label(with_colon("Thumbnail size"), COL_1, 212, COL_W);
-    add_combo(IDC_THUMB_SIZE_COMBO, COL_1, 232, COL_W, &[tr("Small (64 px)"), tr("Standard (128 px)"), tr("Large (256 px)"), tr("Maximum (512 px)")]);
-    label(tr("Thumbnail loading:"), COL_2, 212, COL_W);
-    add_combo(IDC_THUMB_LOADING_COMBO, COL_2, 232, COL_W, &[tr("All in advance"), tr("On demand (less memory)")]);
-    add_checkbox("Show scrollbar", IDC_SCROLLBAR_CHK, COL_1, 274);
-    label(tr("Pro mode priority:"), COL_2, 274, COL_W);
-    add_combo(IDC_PRO_PRIORITY_COMBO, COL_2, 294, COL_W, &[tr("Smooth (higher memory use)"), tr("Performance (lower memory use)")]);
+    add_combo(IDC_PANEL_MODE_COMBO, COL_1, 170, COL_W, &[tr("Low power"), tr("Pro (gallery)"), tr("Notch (top island)")]);
+    label(tr("Pro style:"), COL_2, 150, COL_W);
+    // En el orden de ProStyle::ALL.
+    add_combo(IDC_PRO_STYLE_COMBO, COL_2, 170, COL_W, &[tr("Showcase"), tr("Fan"), tr("Mosaic"), tr("Frame"), tr("Classic carousel")]);
+    label(tr("Thumbnail panel position:"), COL_1, 212, COL_W);
+    add_combo(IDC_PANEL_SIDE_COMBO, COL_1, 232, COL_W, &[tr("Top"), tr("Left"), tr("Right")]);
+    label(tr("Pro mode priority:"), COL_2, 212, COL_W);
+    add_combo(IDC_PRO_PRIORITY_COMBO, COL_2, 232, COL_W, &[tr("Smooth (higher memory use)"), tr("Performance (lower memory use)")]);
+    label(with_colon("Thumbnail size"), COL_1, 274, COL_W);
+    add_combo(IDC_THUMB_SIZE_COMBO, COL_1, 294, COL_W, &[tr("Small (64 px)"), tr("Standard (128 px)"), tr("Large (256 px)"), tr("Maximum (512 px)")]);
+    label(tr("Thumbnail loading:"), COL_2, 274, COL_W);
+    add_combo(IDC_THUMB_LOADING_COMBO, COL_2, 294, COL_W, &[tr("All in advance"), tr("On demand (less memory)")]);
+    add_checkbox("Show scrollbar", IDC_SCROLLBAR_CHK, COL_1, 340);
+    add_checkbox("Notch notice when the wallpaper changes", IDC_NOTCH_NOTIFY_CHK, COL_2, 340);
+    add_checkbox("Show wallpaper names", IDC_SHOW_NAMES_CHK, COL_1, 370);
 
     // General
-    add_checkbox("Detection enabled", IDC_DETECTION_CHK, COL_1, 414);
-    add_checkbox("Scan subfolders", IDC_SUBFOLDERS_CHK, COL_1, 444);
-    add_checkbox("Start with Windows", IDC_AUTOSTART_CHK, COL_1, 474);
-    label(tr("Language:"), COL_2, 414, COL_W);
+    add_checkbox("Detection enabled", IDC_DETECTION_CHK, COL_1, 466);
+    add_checkbox("Scan subfolders", IDC_SUBFOLDERS_CHK, COL_1, 496);
+    add_checkbox("Start with Windows", IDC_AUTOSTART_CHK, COL_1, 526);
+    label(tr("Language:"), COL_2, 466, COL_W);
     let mut options = vec!["auto".to_string()];
     let mut language_items = vec![tr("Automatic (Windows)")];
     for (code, name) in crate::i18n::available_languages() {
         language_items.push(to_wide_chars(&name));
         options.push(code);
     }
-    add_combo(IDC_LANGUAGE_COMBO, COL_2, 434, COL_W, &language_items);
+    add_combo(IDC_LANGUAGE_COMBO, COL_2, 486, COL_W, &language_items);
+    label(tr("Theme:"), COL_2, 528, COL_W);
+    // En el orden de Theme::ALL.
+    add_combo(IDC_THEME_COMBO, COL_2, 548, COL_W, &[tr("Same as Windows"), tr("Dark"), tr("Light")]);
     if let Ok(mut stored) = LANGUAGE_OPTIONS.lock() { *stored = options; }
 
     // Fondo de pantalla
@@ -208,10 +237,26 @@ unsafe fn create_config_controls(hwnd: HWND) {
         tr("Fade"), tr("Slide"), tr("Zoom in"), tr("Wipe"), tr("Circle"), tr("Random effect"),
     ]);
     add_combo(IDC_TRANSITION_COMBO, COL_3 + 180, 398, COL_3_W - 180, &[tr("0.3 s"), tr("0.6 s"), tr("1 s"), tr("1.5 s")]);
-    add_checkbox_w("Random order", IDC_SHUFFLE_CHK, COL_3, 440, COL_3_W);
-    add_checkbox_w("Rotate only favorites", IDC_FAVORITES_ONLY_CHK, COL_3, 466, COL_3_W);
-    add_checkbox_w("Different wallpaper on each monitor", IDC_PER_MONITOR_CHK, COL_3, 492, COL_3_W);
-    style_button(add_control(hwnd, "BUTTON", &tr("Removed images..."), IDC_HIDDEN_BTN, COL_2, 472, COL_W, 30, TAB_STOP), false, true);
+    add_checkbox_w("Preview on the desktop", IDC_LIVE_PREVIEW_CHK, COL_3, 432, COL_3_W);
+    add_checkbox_w("Random order", IDC_SHUFFLE_CHK, COL_3, 462, COL_3_W);
+    add_checkbox_w("Rotate only favorites", IDC_FAVORITES_ONLY_CHK, COL_3, 488, COL_3_W);
+    add_checkbox_w("Different wallpaper on each monitor", IDC_PER_MONITOR_CHK, COL_3, 514, COL_3_W);
+    add_checkbox_w("Play animated wallpapers (GIF, WebP)", IDC_ANIMATED_CHK, COL_3, 548, COL_3_W);
+
+    // Reloj del escritorio (en el orden de ClockStyle::ALL, ClockPosition::ALL y ClockSize::ALL).
+    add_checkbox_w("Show a clock on the desktop", IDC_CLOCK_CHK, COL_4, 150, COL_3_W);
+    label(tr("Clock style:"), COL_4, 186, COL_3_W);
+    add_combo(IDC_CLOCK_STYLE_COMBO, COL_4, 206, COL_3_W, &[tr("Large"), tr("Pill"), tr("Analog"), tr("Greeting"), tr("Stacked")]);
+    label(tr("Position:"), COL_4, 248, COL_3_W);
+    add_combo(IDC_CLOCK_POSITION_COMBO, COL_4, 268, COL_3_W, &[tr("In the center"), tr("Top left"), tr("Top right"), tr("On the left"), tr("On the right"), tr("Bottom left"), tr("Bottom right")]);
+    label(tr("Size:"), COL_4, 310, COL_3_W);
+    add_combo(IDC_CLOCK_SIZE_COMBO, COL_4, 330, COL_3_W, &[tr("Small"), tr("Medium"), tr("Big")]);
+    add_checkbox_w("24-hour format", IDC_CLOCK_24H_CHK, COL_4, 376, COL_3_W);
+    add_checkbox_w("Show seconds", IDC_CLOCK_SECONDS_CHK, COL_4, 406, COL_3_W);
+    add_checkbox_w("Show the date", IDC_CLOCK_DATE_CHK, COL_4, 436, COL_3_W);
+    add_checkbox_w("Only on the main monitor", IDC_CLOCK_MAIN_CHK, COL_4, 466, COL_3_W);
+    label(tr("Needs the SWEPR canvas."), COL_4, 510, COL_3_W);
+    style_button(add_control(hwnd, "BUTTON", &tr("Removed images..."), IDC_HIDDEN_BTN, COL_1, 562, COL_W - 30, 30, TAB_STOP), false, true);
 
     // Atajos de teclado
     let hotkeys = CONFIG_STATE.lock().ok().and_then(|g| g.clone())
@@ -222,17 +267,17 @@ unsafe fn create_config_controls(hwnd: HWND) {
         ("Previous wallpaper:", IDC_HOTKEY_PREVIOUS, &hotkeys.previous_wallpaper),
         ("Next wallpaper:", IDC_HOTKEY_NEXT, &hotkeys.next_wallpaper),
     ].into_iter().enumerate() {
-        let x = COL_1 + index as i32 * 300;
-        label(tr(text), x, 572, 280);
-        let control = add_control(hwnd, super::hotkey_field::CLASS_NAME, &to_wide_chars(""), id, x, 592, 280, 32, TAB_STOP);
+        let x = COL_1 + index as i32 * 404;
+        label(tr(text), x, 656, 380);
+        let control = add_control(hwnd, super::hotkey_field::CLASS_NAME, &to_wide_chars(""), id, x, 676, 380, 32, TAB_STOP);
         let _ = SendMessageW(control, HKM_SETHOTKEY, WPARAM(binding.to_hotkey_value() as usize), LPARAM(0));
     }
 
     // Pie
     const SS_CENTERIMAGE: u32 = 0x0200;
-    add_control(hwnd, "STATIC", &tr("Changes apply after saving."), IDC_FOOTER_NOTE, 16, 652, 672, 32, SS_CENTERIMAGE);
-    style_button(add_control(hwnd, "BUTTON", &tr("Cancel"), IDC_CANCEL_BTN, 704, 652, 102, 32, TAB_STOP), false, false);
-    style_button(add_control(hwnd, "BUTTON", &tr("Save"), IDC_APPLY_BTN, 814, 652, 102, 32, TAB_STOP), true, false);
+    add_control(hwnd, "STATIC", &tr("Changes apply after saving."), IDC_FOOTER_NOTE, 16, 736, 972, 32, SS_CENTERIMAGE);
+    style_button(add_control(hwnd, "BUTTON", &tr("Cancel"), IDC_CANCEL_BTN, 1004, 736, 102, 32, TAB_STOP), false, false);
+    style_button(add_control(hwnd, "BUTTON", &tr("Save"), IDC_APPLY_BTN, 1114, 736, 102, 32, TAB_STOP), true, false);
 }
 
 /// Fondo de la ventana: tarjetas de cada sección y el marco del campo de la carpeta.
@@ -240,7 +285,7 @@ unsafe fn paint_background(hwnd: HWND, dc: HDC) {
     use windows::Win32::Foundation::RECT;
     let mut client = RECT::default();
     let _ = windows::Win32::UI::WindowsAndMessaging::GetClientRect(hwnd, &mut client);
-    let _ = FillRect(dc, &client, super::theme::brush(super::theme::COLOR_WINDOW_BG));
+    let _ = FillRect(dc, &client, super::theme::brush(super::theme::color_window_bg()));
     let title_font = CONFIG_TITLE_FONT.lock().ok().and_then(|g| *g).unwrap_or(0);
     for (title, x, y, width, height) in SECTIONS {
         let rect = RECT { left: px(x), top: px(y), right: px(x + width), bottom: px(y + height) };
@@ -310,16 +355,20 @@ fn combo_selection(combo: HWND) -> usize {
 
 /// La barra de desplazamiento solo existe en el modo de bajo consumo.
 unsafe fn update_mode_dependent_controls(hwnd: HWND) {
-    let pro = GetDlgItem(hwnd, IDC_PANEL_MODE_COMBO).map(|combo| combo_selection(combo) == 1).unwrap_or(false);
+    let mode = GetDlgItem(hwnd, IDC_PANEL_MODE_COMBO).map(|combo| PanelMode::from_index(combo_selection(combo))).unwrap_or_default();
+    let pro = mode == PanelMode::Pro;
+    let strip = mode == PanelMode::LowPower;
     if let Ok(chk) = GetDlgItem(hwnd, IDC_SCROLLBAR_CHK) {
-        let _ = windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow(chk, !pro);
+        let _ = windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow(chk, strip);
     }
     if let Ok(combo) = GetDlgItem(hwnd, IDC_PANEL_SIDE_COMBO) {
-        // El carrusel siempre aparece en el centro: la posición solo vale para la tira.
-        let _ = windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow(combo, !pro);
+        // El carrusel va en el centro y el notch arriba: la posición solo vale para la tira.
+        let _ = windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow(combo, strip);
     }
-    if let Ok(label) = GetDlgItem(hwnd, IDC_PRO_PRIORITY_COMBO) {
-        let _ = windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow(label, pro);
+    for id in [IDC_PRO_PRIORITY_COMBO, IDC_PRO_STYLE_COMBO] {
+        if let Ok(combo) = GetDlgItem(hwnd, id) {
+            let _ = windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow(combo, pro);
+        }
     }
     // "Extender" ya usa una sola imagen para todos los monitores.
     let span = GetDlgItem(hwnd, IDC_FIT_MODE_COMBO)
@@ -330,9 +379,20 @@ unsafe fn update_mode_dependent_controls(hwnd: HWND) {
     }
     // La duración solo se usa con el lienzo.
     let canvas = GetDlgItem(hwnd, IDC_APPLY_MODE_COMBO).map(|combo| combo_selection(combo) == 2).unwrap_or(false);
-    for id in [IDC_TRANSITION_EFFECT_COMBO, IDC_TRANSITION_COMBO] {
+    // Transición y vista previa solo existen con el lienzo.
+    for id in [IDC_TRANSITION_EFFECT_COMBO, IDC_TRANSITION_COMBO, IDC_LIVE_PREVIEW_CHK, IDC_ANIMATED_CHK, IDC_CLOCK_CHK] {
         if let Ok(combo) = GetDlgItem(hwnd, id) {
             let _ = windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow(combo, canvas);
+        }
+    }
+    // Las opciones del reloj, con el reloj activado.
+    let clock = canvas
+        && GetDlgItem(hwnd, IDC_CLOCK_CHK)
+            .map(|chk| SendMessageW(chk, windows::Win32::UI::WindowsAndMessaging::BM_GETCHECK, WPARAM(0), LPARAM(0)).0 == 1)
+            .unwrap_or(false);
+    for id in CLOCK_OPTIONS {
+        if let Ok(control) = GetDlgItem(hwnd, id) {
+            let _ = windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow(control, clock);
         }
     }
 }
@@ -417,23 +477,23 @@ unsafe extern "system" fn config_wnd_proc(
         _ if msg == windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORSTATIC
             || msg == windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORBTN =>
         {
-            use super::theme::{brush, COLOR_CARD_BG, COLOR_LABEL, COLOR_MUTED, COLOR_WINDOW_BG};
+            use super::theme::{brush, color_card_bg, color_label, color_muted, color_window_bg};
             let dc = HDC(wparam.0 as *mut _);
             // Todo va sobre una tarjeta salvo la nota del pie.
             let footer = windows::Win32::UI::WindowsAndMessaging::GetDlgCtrlID(HWND(lparam.0 as *mut _)) == IDC_FOOTER_NOTE;
-            let _ = SetTextColor(dc, if footer { COLOR_MUTED } else { COLOR_LABEL });
+            let _ = SetTextColor(dc, if footer { color_muted() } else { color_label() });
             let _ = SetBkMode(dc, TRANSPARENT);
-            LRESULT(brush(if footer { COLOR_WINDOW_BG } else { COLOR_CARD_BG }).0 as isize)
+            LRESULT(brush(if footer { color_window_bg() } else { color_card_bg() }).0 as isize)
         }
         _ if msg == windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLOREDIT
             || msg == windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORLISTBOX =>
         {
-            use super::theme::{brush, COLOR_FIELD_BG, COLOR_TEXT};
+            use super::theme::{brush, color_field_bg, color_text};
             let dc = HDC(wparam.0 as *mut _);
-            let _ = SetTextColor(dc, COLOR_TEXT);
-            let _ = SetBkColor(dc, COLOR_FIELD_BG);
+            let _ = SetTextColor(dc, color_text());
+            let _ = SetBkColor(dc, color_field_bg());
             let _ = SetBkMode(dc, OPAQUE);
-            LRESULT(brush(COLOR_FIELD_BG).0 as isize)
+            LRESULT(brush(color_field_bg()).0 as isize)
         }
         WM_APP_FOLDER_PICKED => {
             BROWSE_OPEN.store(false, std::sync::atomic::Ordering::Release);
@@ -530,7 +590,7 @@ unsafe extern "system" fn config_wnd_proc(
                         }
                     }
                     if let Ok(combo) = GetDlgItem(hwnd, IDC_PANEL_MODE_COMBO) {
-                        let selection = if config.panel_mode == PanelMode::Pro { 1 } else { 0 };
+                        let selection = config.panel_mode.index();
                         let _ = SendMessageW(combo, windows::Win32::UI::WindowsAndMessaging::CB_SETCURSEL, WPARAM(selection), LPARAM(0));
                     }
                     if let Ok(combo) = GetDlgItem(hwnd, IDC_PRO_PRIORITY_COMBO) {
@@ -571,6 +631,20 @@ unsafe extern "system" fn config_wnd_proc(
                     set_check(IDC_SHUFFLE_CHK, config.shuffle);
                     set_check(IDC_FAVORITES_ONLY_CHK, config.rotation_favorites_only);
                     set_check(IDC_PER_MONITOR_CHK, config.per_monitor);
+                    set_combo(IDC_PRO_STYLE_COMBO, Some(config.pro_style.index()));
+                    set_check(IDC_NOTCH_NOTIFY_CHK, config.notch_notify);
+                    set_check(IDC_LIVE_PREVIEW_CHK, config.live_preview);
+                    set_check(IDC_SHOW_NAMES_CHK, config.show_names);
+                    set_check(IDC_ANIMATED_CHK, config.animated_wallpapers);
+                    set_check(IDC_CLOCK_CHK, config.clock.enabled);
+                    set_combo(IDC_CLOCK_STYLE_COMBO, Some(config.clock.style.index()));
+                    set_combo(IDC_CLOCK_POSITION_COMBO, Some(config.clock.position.index()));
+                    set_combo(IDC_CLOCK_SIZE_COMBO, Some(config.clock.size.index()));
+                    set_check(IDC_CLOCK_24H_CHK, config.clock.hour24);
+                    set_check(IDC_CLOCK_SECONDS_CHK, config.clock.seconds);
+                    set_check(IDC_CLOCK_DATE_CHK, config.clock.date);
+                    set_check(IDC_CLOCK_MAIN_CHK, config.clock.main_monitor_only);
+                    set_combo(IDC_THEME_COMBO, Some(config.theme.index()));
                     update_mode_dependent_controls(hwnd);
                 }
             }
@@ -722,11 +796,11 @@ unsafe extern "system" fn config_wnd_proc(
                                     2 => PanelSide::Right,
                                     _ => PanelSide::Top,
                                 };
-                                config.zones.active_zones = config.panel_side.active_zones();
                             }
                             if let Ok(combo) = GetDlgItem(hwnd, IDC_PANEL_MODE_COMBO) {
-                                config.panel_mode = if combo_selection(combo) == 1 { PanelMode::Pro } else { PanelMode::LowPower };
+                                config.panel_mode = PanelMode::from_index(combo_selection(combo));
                             }
+                            config.zones.active_zones = config.panel_side.active_zones(config.panel_mode);
                             if let Ok(combo) = GetDlgItem(hwnd, IDC_PRO_PRIORITY_COMBO) {
                                 config.pro_priority = if combo_selection(combo) == 1 { ProPriority::Performance } else { ProPriority::Smooth };
                             }
@@ -761,6 +835,30 @@ unsafe extern "system" fn config_wnd_proc(
                             config.shuffle = checked(IDC_SHUFFLE_CHK);
                             config.rotation_favorites_only = checked(IDC_FAVORITES_ONLY_CHK);
                             config.per_monitor = checked(IDC_PER_MONITOR_CHK);
+                            config.notch_notify = checked(IDC_NOTCH_NOTIFY_CHK);
+                            config.live_preview = checked(IDC_LIVE_PREVIEW_CHK);
+                            config.show_names = checked(IDC_SHOW_NAMES_CHK);
+                            config.animated_wallpapers = checked(IDC_ANIMATED_CHK);
+                            config.clock.enabled = checked(IDC_CLOCK_CHK);
+                            config.clock.hour24 = checked(IDC_CLOCK_24H_CHK);
+                            config.clock.seconds = checked(IDC_CLOCK_SECONDS_CHK);
+                            config.clock.date = checked(IDC_CLOCK_DATE_CHK);
+                            config.clock.main_monitor_only = checked(IDC_CLOCK_MAIN_CHK);
+                            if let Ok(combo) = GetDlgItem(hwnd, IDC_CLOCK_STYLE_COMBO) {
+                                config.clock.style = ClockStyle::from_index(combo_selection(combo));
+                            }
+                            if let Ok(combo) = GetDlgItem(hwnd, IDC_CLOCK_POSITION_COMBO) {
+                                config.clock.position = ClockPosition::from_index(combo_selection(combo));
+                            }
+                            if let Ok(combo) = GetDlgItem(hwnd, IDC_CLOCK_SIZE_COMBO) {
+                                config.clock.size = ClockSize::from_index(combo_selection(combo));
+                            }
+                            if let Ok(combo) = GetDlgItem(hwnd, IDC_THEME_COMBO) {
+                                config.theme = Theme::from_index(combo_selection(combo));
+                            }
+                            if let Ok(combo) = GetDlgItem(hwnd, IDC_PRO_STYLE_COMBO) {
+                                config.pro_style = ProStyle::from_index(combo_selection(combo));
+                            }
                             let autostart_enabled = config.autostart;
                             if let Err(e) = config.save() {
                                 crate::log_error!("No se pudo guardar la configuración: {e}");
@@ -794,6 +892,23 @@ unsafe extern "system" fn config_wnd_proc(
                         super::hidden::show(hwnd, config);
                     }
                 }
+                IDC_THEME_COMBO => {
+                    // CBN_SELCHANGE: el tema se ve al momento; si no se guarda, se vuelve al anterior al cerrar.
+                    if (wparam.0 >> 16) & 0xFFFF == 1 {
+                        if let Ok(combo) = GetDlgItem(hwnd, IDC_THEME_COMBO) {
+                            crate::winutil::set_theme(Theme::from_index(combo_selection(combo)).code());
+                        }
+                        super::theme::apply_window_frame(hwnd);
+                        use windows::Win32::Graphics::Gdi::{RedrawWindow, RDW_ALLCHILDREN, RDW_ERASE, RDW_FRAME, RDW_INVALIDATE};
+                        let _ = RedrawWindow(hwnd, None, None, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_FRAME);
+                    }
+                }
+                IDC_CLOCK_CHK => {
+                    // BN_CLICKED
+                    if (wparam.0 >> 16) & 0xFFFF == 0 {
+                        update_mode_dependent_controls(hwnd);
+                    }
+                }
                 IDC_PANEL_MODE_COMBO | IDC_FIT_MODE_COMBO | IDC_APPLY_MODE_COMBO => {
                     // CBN_SELCHANGE
                     if (wparam.0 >> 16) & 0xFFFF == 1 {
@@ -816,6 +931,10 @@ unsafe extern "system" fn config_wnd_proc(
         }
         WM_DESTROY => {
             if let Ok(mut g) = CONFIG_HWND.lock() { *g = None; }
+            // El tema guardado (el que se probó en el desplegable se descarta si no se guardó).
+            if let Some(theme) = CONFIG_STATE.lock().ok().and_then(|g| g.clone()).and_then(|c| c.lock().ok().map(|c| c.theme)) {
+                crate::winutil::set_theme(theme.code());
+            }
             // Tras guardar ya está la configuración nueva: los atajos se registran con ella.
             post_suspend_hotkeys(false);
             for storage in [&CONFIG_FONT, &CONFIG_TITLE_FONT] {
@@ -850,7 +969,7 @@ pub fn show_config_window(config: Arc<Mutex<AppConfig>>) {
             lpfnWndProc: Some(config_wnd_proc),
             hInstance: hinstance,
             hIcon: crate::resources::app_icon(),
-            hbrBackground: super::theme::brush(super::theme::COLOR_WINDOW_BG),
+            hbrBackground: super::theme::brush(super::theme::color_window_bg()),
             lpszClassName: as_pcwstr(&class_name_wide),
             ..Default::default()
         };
@@ -891,21 +1010,7 @@ pub fn show_config_window(config: Arc<Mutex<AppConfig>>) {
             }
         };
 
-        let use_dark_titlebar = BOOL(1);
-        let _ = DwmSetWindowAttribute(
-            hwnd,
-            DWMWA_USE_IMMERSIVE_DARK_MODE,
-            &use_dark_titlebar as *const _ as *const std::ffi::c_void,
-            std::mem::size_of::<BOOL>() as u32,
-        );
-        // Barra de título del mismo color que la ventana (Windows 11; en Windows 10 se ignora).
-        let caption = super::theme::COLOR_WINDOW_BG;
-        let _ = DwmSetWindowAttribute(
-            hwnd,
-            windows::Win32::Graphics::Dwm::DWMWA_CAPTION_COLOR,
-            &caption as *const _ as *const std::ffi::c_void,
-            std::mem::size_of_val(&caption) as u32,
-        );
+        super::theme::apply_window_frame(hwnd);
         if let Ok(mut g) = CONFIG_HWND.lock() { *g = Some(hwnd.0 as isize); }
         let _ = ShowWindow(hwnd, SW_SHOW);
         log_info!("Ventana de configuración mostrada");
@@ -921,6 +1026,7 @@ mod tests {
     #[test]
     #[ignore]
     fn render_settings_preview() {
+        if std::env::var("SWEPR_TEST_LIGHT").is_ok() { crate::winutil::set_theme(2); }
         use windows::Win32::Graphics::Gdi::{CreateCompatibleBitmap, CreateCompatibleDC, GetDC, ReleaseDC, SelectObject};
         let path = std::env::var("SWEPR_SETTINGS_PREVIEW").unwrap_or_else(|_| "settings_preview.bmp".into());
         unsafe {

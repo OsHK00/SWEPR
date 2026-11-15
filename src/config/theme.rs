@@ -1,4 +1,4 @@
-//! Aspecto oscuro de la ventana de configuración, dibujado con GDI: tarjetas por sección,
+//! Aspecto oscuro o claro de la ventana de configuración, dibujado con GDI: tarjetas por sección,
 //! casillas, desplegables y botones. Los controles siguen siendo los de Windows (teclado,
 //! ratón y mensajes funcionan igual); solo se sustituye su pintado.
 
@@ -20,24 +20,59 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_MOUSEWHEEL, WM_PAINT, WM_SETFOCUS, WM_SETTEXT, WNDPROC,
 };
 
-pub const COLOR_WINDOW_BG: COLORREF = COLORREF(0x001F1F1F);
-pub const COLOR_CARD_BG: COLORREF = COLORREF(0x002A2A2A);
-const COLOR_CARD_BORDER: COLORREF = COLORREF(0x00363636);
-pub const COLOR_FIELD_BG: COLORREF = COLORREF(0x00363636);
-const COLOR_FIELD_BORDER: COLORREF = COLORREF(0x00484848);
-const COLOR_FIELD_BORDER_HOT: COLORREF = COLORREF(0x00606060);
-pub const COLOR_TEXT: COLORREF = COLORREF(0x00F0F0F0);
-pub const COLOR_LABEL: COLORREF = COLORREF(0x00C4C4C4);
-pub const COLOR_MUTED: COLORREF = COLORREF(0x008C8C8C);
-const COLOR_DISABLED: COLORREF = COLORREF(0x00686868);
-/// Azul de acento (el mismo que marca el fondo actual en el panel).
-const COLOR_ACCENT: COLORREF = COLORREF(0x00FFC24C);
-const COLOR_ACCENT_HOT: COLORREF = COLORREF(0x00FFD17A);
-const COLOR_ACCENT_PRESSED: COLORREF = COLORREF(0x00D9A33F);
-const COLOR_ON_ACCENT: COLORREF = COLORREF(0x00101010);
-const COLOR_BUTTON: COLORREF = COLORREF(0x003A3A3A);
-const COLOR_BUTTON_HOT: COLORREF = COLORREF(0x00454545);
-const COLOR_BUTTON_PRESSED: COLORREF = COLORREF(0x00303030);
+/// Color según el tema: `dark` y `light` en formato 0x00BBGGRR.
+fn pick(dark: u32, light: u32) -> COLORREF { COLORREF(if crate::winutil::light_theme() { light } else { dark }) }
+
+pub fn color_window_bg() -> COLORREF { pick(0x001F1F1F, 0x00F3F3F3) }
+pub fn color_card_bg() -> COLORREF { pick(0x002A2A2A, 0x00FFFFFF) }
+fn color_card_border() -> COLORREF { pick(0x00363636, 0x00E3E3E3) }
+pub fn color_field_bg() -> COLORREF { pick(0x00363636, 0x00F7F7F7) }
+fn color_field_border() -> COLORREF { pick(0x00484848, 0x00D2D2D2) }
+fn color_field_border_hot() -> COLORREF { pick(0x00606060, 0x00A8A8A8) }
+pub fn color_text() -> COLORREF { pick(0x00F0F0F0, 0x001A1A1A) }
+pub fn color_label() -> COLORREF { pick(0x00C4C4C4, 0x00404040) }
+pub fn color_muted() -> COLORREF { pick(0x008C8C8C, 0x00707070) }
+fn color_disabled() -> COLORREF { pick(0x00686868, 0x00B4B4B4) }
+/// Borde de la ventana (un poco más claro que el fondo en oscuro, más oscuro en claro).
+pub fn color_window_border() -> COLORREF { pick(0x00404040, 0x00D0D0D0) }
+
+/// Barra de título, esquinas y borde de una ventana de configuración según el tema (Windows 11).
+pub unsafe fn apply_window_frame(hwnd: HWND) {
+    use windows::Win32::Graphics::Dwm::{
+        DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE,
+        DWMWCP_ROUND,
+    };
+    let set = |attribute, value: *const std::ffi::c_void, size: usize| {
+        let _ = DwmSetWindowAttribute(hwnd, attribute, value, size as u32);
+    };
+    let dark = windows::Win32::Foundation::BOOL(!crate::winutil::light_theme() as i32);
+    set(DWMWA_USE_IMMERSIVE_DARK_MODE, &dark as *const _ as _, std::mem::size_of_val(&dark));
+    let caption = color_window_bg();
+    set(DWMWA_CAPTION_COLOR, &caption as *const _ as _, std::mem::size_of_val(&caption));
+    let corner = DWMWCP_ROUND;
+    set(DWMWA_WINDOW_CORNER_PREFERENCE, &corner as *const _ as _, std::mem::size_of_val(&corner));
+    let border = color_window_border();
+    set(DWMWA_BORDER_COLOR, &border as *const _ as _, std::mem::size_of_val(&border));
+}
+
+/// Acento del sistema (el mismo que marca el fondo actual en el panel), con `shift` para
+/// aclararlo (> 0) u oscurecerlo (< 0).
+fn accent_shifted(shift: f32) -> COLORREF {
+    let (r, g, b) = crate::winutil::accent_rgb();
+    let adjust = |c: u8| -> u32 {
+        let c = c as f32;
+        let out = if shift >= 0.0 { c + (255.0 - c) * shift } else { c * (1.0 + shift) };
+        out.round().clamp(0.0, 255.0) as u32
+    };
+    COLORREF(adjust(r) | (adjust(g) << 8) | (adjust(b) << 16))
+}
+fn color_accent() -> COLORREF { accent_shifted(0.0) }
+fn color_accent_hot() -> COLORREF { accent_shifted(0.18) }
+fn color_accent_pressed() -> COLORREF { accent_shifted(-0.15) }
+fn color_on_accent() -> COLORREF { pick(0x00101010, 0x00FFFFFF) }
+fn color_button() -> COLORREF { pick(0x003A3A3A, 0x00FBFBFB) }
+fn color_button_hot() -> COLORREF { pick(0x00454545, 0x00F0F0F0) }
+fn color_button_pressed() -> COLORREF { pick(0x00303030, 0x00E4E4E4) }
 
 /// Marcas guardadas en GWLP_USERDATA de cada control.
 const FLAG_HOT: isize = 1;
@@ -97,16 +132,16 @@ pub unsafe fn draw_text(dc: HDC, text: &str, rect: &RECT, font: isize, color: CO
 
 /// Fondo de un campo (texto, desplegable, atajo) sobre una tarjeta.
 pub unsafe fn draw_field(dc: HDC, rect: &RECT, focused: bool, hot: bool) {
-    let _ = FillRect(dc, rect, brush(COLOR_CARD_BG));
-    let border = if focused { COLOR_ACCENT } else if hot { COLOR_FIELD_BORDER_HOT } else { COLOR_FIELD_BORDER };
-    round_rect(dc, rect, px(4), COLOR_FIELD_BG, border);
+    let _ = FillRect(dc, rect, brush(color_card_bg()));
+    let border = if focused { color_accent() } else if hot { color_field_border_hot() } else { color_field_border() };
+    round_rect(dc, rect, px(4), color_field_bg(), border);
 }
 
 /// Tarjeta de una sección con su título.
 pub unsafe fn draw_card(dc: HDC, rect: &RECT, title: &str, title_font: isize) {
-    round_rect(dc, rect, px(8), COLOR_CARD_BG, COLOR_CARD_BORDER);
+    round_rect(dc, rect, px(8), color_card_bg(), color_card_border());
     let title_rect = RECT { left: rect.left + px(16), top: rect.top + px(10), right: rect.right - px(16), bottom: rect.top + px(36) };
-    draw_text(dc, title, &title_rect, title_font, COLOR_TEXT, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    draw_text(dc, title, &title_rect, title_font, color_text(), DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 }
 
 /// Pinta en un lienzo en memoria y lo copia de una vez (sin parpadeo).
@@ -213,7 +248,7 @@ unsafe fn paint_button(hwnd: HWND, dc: HDC, rect: &RECT) {
     let state = SendMessageW(hwnd, BM_GETSTATE, WPARAM(0), LPARAM(0)).0;
     let text = window_text(hwnd);
     let font = super::window::ui_font();
-    let background = if flags & FLAG_ON_CARD != 0 { COLOR_CARD_BG } else { COLOR_WINDOW_BG };
+    let background = if flags & FLAG_ON_CARD != 0 { color_card_bg() } else { color_window_bg() };
     let _ = FillRect(dc, rect, brush(background));
 
     let is_checkbox = GetWindowLongW(hwnd, GWL_STYLE) & 0xF == 3;
@@ -223,10 +258,10 @@ unsafe fn paint_button(hwnd: HWND, dc: HDC, rect: &RECT) {
         let check_rect = RECT { left: rect.left, top, right: rect.left + size, bottom: top + size };
         let checked = state & BST_CHECKED != 0;
         let (fill, border) = match (enabled, checked) {
-            (false, true) => (COLOR_DISABLED, COLOR_DISABLED),
-            (false, false) => (COLOR_CARD_BG, COLOR_DISABLED),
-            (true, true) => (if hot { COLOR_ACCENT_HOT } else { COLOR_ACCENT }, if hot { COLOR_ACCENT_HOT } else { COLOR_ACCENT }),
-            (true, false) => (if hot { COLOR_FIELD_BG } else { COLOR_CARD_BG }, if hot { COLOR_LABEL } else { COLOR_MUTED }),
+            (false, true) => (color_disabled(), color_disabled()),
+            (false, false) => (color_card_bg(), color_disabled()),
+            (true, true) => (if hot { color_accent_hot() } else { color_accent() }, if hot { color_accent_hot() } else { color_accent() }),
+            (true, false) => (if hot { color_field_bg() } else { color_card_bg() }, if hot { color_label() } else { color_muted() }),
         };
         round_rect(dc, &check_rect, px(4), fill, border);
         if checked {
@@ -236,10 +271,10 @@ unsafe fn paint_button(hwnd: HWND, dc: HDC, rect: &RECT) {
                 POINT { x: x + size * 43 / 100, y: y + size * 68 / 100 },
                 POINT { x: x + size * 75 / 100, y: y + size * 34 / 100 },
             ];
-            polyline(dc, &points, px(2).max(2), COLOR_ON_ACCENT);
+            polyline(dc, &points, px(2).max(2), color_on_accent());
         }
         let text_rect = RECT { left: check_rect.right + px(10), ..*rect };
-        let color = if enabled { COLOR_TEXT } else { COLOR_DISABLED };
+        let color = if enabled { color_text() } else { color_disabled() };
         draw_text(dc, &text, &text_rect, font, color, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
         return;
     }
@@ -247,11 +282,11 @@ unsafe fn paint_button(hwnd: HWND, dc: HDC, rect: &RECT) {
     let pressed = state & BST_PUSHED != 0;
     let primary = flags & FLAG_PRIMARY != 0;
     let (fill, border, text_color) = if primary {
-        let fill = if pressed { COLOR_ACCENT_PRESSED } else if hot { COLOR_ACCENT_HOT } else { COLOR_ACCENT };
-        (fill, fill, COLOR_ON_ACCENT)
+        let fill = if pressed { color_accent_pressed() } else if hot { color_accent_hot() } else { color_accent() };
+        (fill, fill, color_on_accent())
     } else {
-        let fill = if pressed { COLOR_BUTTON_PRESSED } else if hot { COLOR_BUTTON_HOT } else { COLOR_BUTTON };
-        (fill, COLOR_FIELD_BORDER, COLOR_TEXT)
+        let fill = if pressed { color_button_pressed() } else if hot { color_button_hot() } else { color_button() };
+        (fill, color_field_border(), color_text())
     };
     round_rect(dc, rect, px(4), fill, border);
     draw_text(dc, &text, rect, font, text_color, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
@@ -303,7 +338,7 @@ unsafe fn paint_combo(hwnd: HWND, dc: HDC, rect: &RECT) {
     }
     let arrow_space = px(30);
     let text_rect = RECT { left: rect.left + px(10), right: rect.right - arrow_space, ..*rect };
-    let color = if enabled { COLOR_TEXT } else { COLOR_DISABLED };
+    let color = if enabled { color_text() } else { color_disabled() };
     draw_text(dc, &text, &text_rect, super::window::ui_font(), color, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 
     // Flecha en forma de "v".
@@ -311,5 +346,5 @@ unsafe fn paint_combo(hwnd: HWND, dc: HDC, rect: &RECT) {
     let cy = (rect.top + rect.bottom) / 2;
     let w = px(4);
     let points = [POINT { x: cx - w, y: cy - w / 2 }, POINT { x: cx, y: cy + w / 2 }, POINT { x: cx + w, y: cy - w / 2 }];
-    polyline(dc, &points, px(1).max(1) + 1, if enabled { COLOR_LABEL } else { COLOR_DISABLED });
+    polyline(dc, &points, px(1).max(1) + 1, if enabled { color_label() } else { color_disabled() });
 }
