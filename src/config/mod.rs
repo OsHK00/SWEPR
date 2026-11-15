@@ -275,6 +275,8 @@ pub enum ClockStyle {
     Stacked,
     /// Saludo según la hora del día, la hora grande y la fecha.
     Greeting,
+    /// Recortes de revista inclinados, en blanco, negro y rojo.
+    Collage,
 }
 
 /// Dónde va el reloj en el monitor.
@@ -312,7 +314,7 @@ macro_rules! combo_enum {
         }
     };
 }
-combo_enum!(ClockStyle, [Large, Pill, Analog, Greeting, Stacked]);
+combo_enum!(ClockStyle, [Large, Pill, Analog, Greeting, Stacked, Collage]);
 combo_enum!(ClockPosition, [Center, TopLeft, TopRight, Left, Right, BottomLeft, BottomRight]);
 combo_enum!(ClockSize, [Small, Medium, Large]);
 

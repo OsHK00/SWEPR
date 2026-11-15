@@ -15,11 +15,15 @@ pub const WM_APP_SCAN_COMPLETE: u32 = WM_APP + 10;
 /// Extensiones de imagen que SWEPR muestra y que Windows acepta como fondo.
 pub const SUPPORTED_EXTENSIONS: [&str; 9] = ["jpg", "jpeg", "jfif", "png", "bmp", "webp", "gif", "tif", "tiff"];
 
-/// ¿El nombre (o la ruta) termina en una extensión de imagen soportada?
+/// Vídeos que el lienzo reproduce como fondo (con Media Foundation). A Windows se le da su
+/// primer fotograma.
+pub const VIDEO_EXTENSIONS: [&str; 7] = ["mp4", "m4v", "mov", "mkv", "webm", "wmv", "avi"];
+
+/// ¿El nombre (o la ruta) termina en una extensión de imagen o vídeo soportada?
 pub fn is_supported_image(name: &Path) -> bool {
     name.extension()
         .and_then(|e| e.to_str())
-        .is_some_and(|ext| SUPPORTED_EXTENSIONS.iter().any(|supported| ext.eq_ignore_ascii_case(supported)))
+        .is_some_and(|ext| SUPPORTED_EXTENSIONS.iter().chain(VIDEO_EXTENSIONS.iter()).any(|supported| ext.eq_ignore_ascii_case(supported)))
 }
 
 #[derive(Debug, Clone)]
@@ -237,6 +241,7 @@ mod tests {
         assert!(is_supported_image(Path::new(r"C:\a\b.JPG")));
         assert!(is_supported_image(Path::new("x.webp")));
         assert!(is_supported_image(Path::new("x.Tiff")));
+        assert!(is_supported_image(Path::new("x.MP4")));
         assert!(!is_supported_image(Path::new("x.txt")));
         assert!(!is_supported_image(Path::new("carpeta")));
     }

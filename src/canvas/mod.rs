@@ -8,12 +8,13 @@
 //! - Lienzo: dueño de la ventana y de Direct2D. Como su ventana es hija de una ventana del
 //!   Explorador, este hilo comparte cola de entrada con él: nunca debe bloquearse, solo dibuja.
 //!
-//! Solo se dibuja durante las transiciones y, con un fondo animado (GIF/WebP), al cambiar de
-//! fotograma; con el fondo quieto no consume nada.
+//! Solo se dibuja durante las transiciones y, con un fondo animado (GIF/WebP) o de vídeo, al
+//! cambiar de fotograma; con el fondo quieto no consume nada.
 
 mod anim;
 mod clock;
 mod layout;
+pub mod video;
 
 pub use anim::set_enabled as set_animations;
 pub use layout::Area;
@@ -104,6 +105,8 @@ struct AnimFrames {
     width: u32,
     height: u32,
     luma: [f32; 9],
+    /// Es un vídeo: `frames` solo trae el primer fotograma y el resto lo va leyendo un `video::Player`.
+    video: bool,
 }
 
 /// Imágenes pedidas al decodificador que aún no ha recogido (para cancelar una animación a medias).
@@ -286,12 +289,19 @@ fn decoder_loop(jobs: Receiver<DecodeJob>, commands: Sender<Command>) {
         }
         for job in latest {
             let started = Instant::now();
+            let (mut first_pixels, mut first_size, mut first_luma) = (Vec::new(), (0, 0), [0.0f32; 9]);
             trace!("decodificando {:?}", job.path.file_name().unwrap_or_default());
             // Primero la imagen fija (o el primer fotograma), para que la transición empiece ya.
             match unsafe { decode_still(&factory, &job) } {
                 Ok((pixels, width, height)) => {
                     crate::log_debug!("Lienzo: {:?} decodificada a {width}x{height} en {} ms", job.path.file_name().unwrap_or_default(), started.elapsed().as_millis());
                     let luma = clock::region_luma(&pixels, width, height);
+                    // Copia del primer fotograma para el reproductor de vídeo (hasta que lea el suyo).
+                    if video::is_video(&job.path) && anim::enabled() {
+                        first_pixels = pixels.clone();
+                        first_size = (width, height);
+                        first_luma = luma;
+                    }
                     let frame = Frame { pixels, width, height, path: job.path.clone(), target: job.target, fit: job.fit, duration: job.duration, effect: job.effect, luma };
                     if commands.send(Command::Show(frame)).is_err() {
                         return;
@@ -305,7 +315,20 @@ fn decoder_loop(jobs: Receiver<DecodeJob>, commands: Sender<Command>) {
                 }
             }
             // Después, si es animada, todos los fotogramas (se deja si mientras se pide otra imagen).
-            if !anim::enabled() || !anim::is_animated_format(&job.path) { continue; }
+            if !anim::enabled() { continue; }
+            if video::is_video(&job.path) {
+                // El vídeo se va leyendo mientras se reproduce: basta con su primer fotograma.
+                let frames = AnimFrames {
+                    path: job.path, target: job.target, fit: job.fit, luma: first_luma,
+                    frames: vec![first_pixels], delays: Vec::new(), width: first_size.0, height: first_size.1, video: true,
+                };
+                if commands.send(Command::Animate(frames)).is_err() {
+                    return;
+                }
+                wake_canvas();
+                continue;
+            }
+            if !anim::is_animated_format(&job.path) { continue; }
             let started = Instant::now();
             let cancel = || PENDING_JOBS.load(Ordering::Acquire) > 0;
             match anim::decode(&job.path, |native| decode_size(job.fit, native, job.area_size), cancel) {
@@ -317,7 +340,7 @@ fn decoder_loop(jobs: Receiver<DecodeJob>, commands: Sender<Command>) {
                     let luma = clock::region_luma(&animation.frames[0], animation.width, animation.height);
                     let frames = AnimFrames {
                         path: job.path, target: job.target, fit: job.fit, luma,
-                        frames: animation.frames, delays: animation.delays, width: animation.width, height: animation.height,
+                        frames: animation.frames, delays: animation.delays, width: animation.width, height: animation.height, video: false,
                     };
                     if commands.send(Command::Animate(frames)).is_err() {
                         return;
@@ -339,6 +362,9 @@ unsafe fn wic_factory() -> windows::core::Result<windows::Win32::Graphics::Imagi
 /// La imagen fija con WIC; un GIF o WebP que WIC no sabe abrir (sin códec de WebP), con el
 /// decodificador propio.
 unsafe fn decode_still(factory: &windows::Win32::Graphics::Imaging::IWICImagingFactory, job: &DecodeJob) -> Result<(Vec<u8>, u32, u32), String> {
+    if video::is_video(&job.path) {
+        return video::first_frame(&job.path, |native| decode_size(job.fit, native, job.area_size));
+    }
     match decode(factory, job) {
         Ok(decoded) => Ok(decoded),
         Err(wic) if anim::is_animated_format(&job.path) => {
@@ -426,12 +452,22 @@ struct Layer {
 /// Reproducción de un fondo animado.
 struct Playback {
     bitmap: ID2D1Bitmap,
-    frames: Vec<Vec<u8>>,
-    delays: Vec<Duration>,
     stride: u32,
-    index: Cell<usize>,
-    /// Cuándo toca el siguiente fotograma.
-    due: Cell<Instant>,
+    motion: Motion,
+}
+
+/// De dónde salen los fotogramas.
+enum Motion {
+    /// GIF/WebP: todos en memoria, cada uno con su duración.
+    Frames {
+        frames: Vec<Vec<u8>>,
+        delays: Vec<Duration>,
+        index: Cell<usize>,
+        /// Cuándo toca el siguiente fotograma.
+        due: Cell<Instant>,
+    },
+    /// Vídeo: los decodifica su propio hilo, que despierta al lienzo con cada uno.
+    Video(video::Player),
 }
 
 /// Cada cuánto se mira si hay que pausar las animaciones (pantalla completa, batería...).
@@ -935,6 +971,16 @@ impl CanvasWindow {
         }
         for (index, slot) in self.slots.iter_mut().enumerate() {
             if chosen.is_some_and(|chosen| chosen != index) { continue; }
+            // La misma imagen ya está puesta (p. ej. se aplica la que se estaba previsualizando):
+            // se deja como está. Si no, la animación en curso se fundiría con su propio primer
+            // fotograma y se verían dos copias superpuestas, y además volvería a empezar.
+            let same = slot.current.as_ref().is_some_and(|current| {
+                current.fit == layer.fit
+                    && crate::winutil::same_path(&current.path, &layer.path)
+                    && (current.playback.is_none() || anim::enabled())
+                    && (current.playback.is_some() || current.size == layer.size)
+            });
+            if same { continue; }
             // Si llega otra imagen a mitad de transición, se parte de la que ya estaba entrando.
             slot.previous = if frame.duration.is_zero() { None } else { slot.current.take() };
             slot.current = Some(layer.clone());
@@ -1015,6 +1061,17 @@ impl CanvasWindow {
     /// monitores que lo muestran (si mientras tanto se puso otra imagen, se descartan).
     fn animate(&mut self, frames: AnimFrames) {
         let Some(target) = self.target.clone() else { return; };
+        let overlaps = |a: &RECT, b: &RECT| a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom;
+        let accepts: Vec<usize> = self.slots.iter().enumerate()
+            .filter(|(_, slot)| match frames.target {
+                Target::Monitor(rect) => overlaps(&slot.screen, &rect),
+                Target::All => true,
+            })
+            .filter(|(_, slot)| slot.current.as_ref().is_some_and(|current| current.path == frames.path && current.playback.is_none()))
+            .map(|(index, _)| index)
+            .collect();
+        // Nadie lo muestra ya (se pidió otra imagen): ni se sube ni se empieza el vídeo.
+        if accepts.is_empty() { return; }
         let properties = D2D1_BITMAP_PROPERTIES {
             pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED },
             dpiX: 96.0,
@@ -1025,19 +1082,16 @@ impl CanvasWindow {
             target.CreateBitmap(D2D_SIZE_U { width: frames.width, height: frames.height }, Some(frames.frames[0].as_ptr() as *const _), stride, &properties)
         };
         let Ok(bitmap) = bitmap else { return; };
-        let first = frames.delays.first().copied().unwrap_or(Duration::from_millis(100));
-        let playback = Rc::new(Playback {
-            bitmap: bitmap.clone(), frames: frames.frames, delays: frames.delays, stride, index: Cell::new(0), due: Cell::new(Instant::now() + first),
-        });
+        let motion = if frames.video {
+            Motion::Video(video::Player::start(&frames.path, (frames.width, frames.height)))
+        } else {
+            let first = frames.delays.first().copied().unwrap_or(Duration::from_millis(100));
+            Motion::Frames { frames: frames.frames, delays: frames.delays, index: Cell::new(0), due: Cell::new(Instant::now() + first) }
+        };
+        let playback = Rc::new(Playback { bitmap: bitmap.clone(), stride, motion });
         let layer = Layer { bitmap, size: (frames.width as f32, frames.height as f32), fit: frames.fit, path: frames.path, playback: Some(playback), luma: frames.luma };
-        let overlaps = |a: &RECT, b: &RECT| a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom;
-        for slot in self.slots.iter_mut() {
-            if let Target::Monitor(rect) = frames.target {
-                if !overlaps(&slot.screen, &rect) { continue; }
-            }
-            if slot.current.as_ref().is_some_and(|current| current.path == layer.path && current.playback.is_none()) {
-                slot.current = Some(layer.clone());
-            }
+        for index in accepts {
+            self.slots[index].current = Some(layer.clone());
         }
     }
 
@@ -1077,7 +1131,11 @@ impl CanvasWindow {
         let now = Instant::now();
         let next = playbacks.iter()
             .filter(|(_, screens)| !self.is_paused(screens))
-            .map(|(playback, _)| playback.due.get().saturating_duration_since(now))
+            .map(|(playback, _)| match &playback.motion {
+                Motion::Frames { due, .. } => due.get().saturating_duration_since(now),
+                // El hilo del vídeo despierta al lienzo con cada fotograma.
+                Motion::Video(_) => PAUSE_CHECK,
+            })
             .min()
             .unwrap_or(PAUSE_CHECK);
         // Aunque esté en pausa, se vuelve a mirar cada poco por si hay que reanudar.
@@ -1134,22 +1192,35 @@ impl CanvasWindow {
         self.refresh_pause(now);
         let mut dirty = false;
         for (playback, screens) in playbacks {
-            if self.is_paused(&screens) {
+            let paused = self.is_paused(&screens);
+            let (frames, delays, index, due) = match &playback.motion {
+                Motion::Video(player) => {
+                    player.set_paused(paused);
+                    if !paused && player.take_frame(|pixels| unsafe {
+                        let _ = playback.bitmap.CopyFromMemory(None, pixels.as_ptr() as *const _, playback.stride);
+                    }) {
+                        dirty = true;
+                    }
+                    continue;
+                }
+                Motion::Frames { frames, delays, index, due } => (frames, delays, index, due),
+            };
+            if paused {
                 // Al reanudar sigue desde aquí, sin correr para recuperar el tiempo perdido.
-                playback.due.set(now + PAUSE_CHECK);
+                due.set(now + PAUSE_CHECK);
                 continue;
             }
-            if now < playback.due.get() { continue; }
-            let index = (playback.index.get() + 1) % playback.frames.len();
-            playback.index.set(index);
-            let pixels = &playback.frames[index];
+            if now < due.get() { continue; }
+            let next = (index.get() + 1) % frames.len();
+            index.set(next);
+            let pixels = &frames[next];
             if unsafe { playback.bitmap.CopyFromMemory(None, pixels.as_ptr() as *const _, playback.stride) }.is_err() {
                 continue;
             }
-            let mut due = playback.due.get() + playback.delays[index];
+            let mut next_due = due.get() + delays[next];
             // Si se quedó atrás (equipo ocupado), no intenta ponerse al día de golpe.
-            if due < now { due = now + playback.delays[index]; }
-            playback.due.set(due);
+            if next_due < now { next_due = now + delays[next]; }
+            due.set(next_due);
             dirty = true;
         }
         dirty

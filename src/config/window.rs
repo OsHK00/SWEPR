@@ -241,12 +241,12 @@ unsafe fn create_config_controls(hwnd: HWND) {
     add_checkbox_w("Random order", IDC_SHUFFLE_CHK, COL_3, 462, COL_3_W);
     add_checkbox_w("Rotate only favorites", IDC_FAVORITES_ONLY_CHK, COL_3, 488, COL_3_W);
     add_checkbox_w("Different wallpaper on each monitor", IDC_PER_MONITOR_CHK, COL_3, 514, COL_3_W);
-    add_checkbox_w("Play animated wallpapers (GIF, WebP)", IDC_ANIMATED_CHK, COL_3, 548, COL_3_W);
+    add_checkbox_w("Play animated and video wallpapers", IDC_ANIMATED_CHK, COL_3, 548, COL_3_W);
 
     // Reloj del escritorio (en el orden de ClockStyle::ALL, ClockPosition::ALL y ClockSize::ALL).
     add_checkbox_w("Show a clock on the desktop", IDC_CLOCK_CHK, COL_4, 150, COL_3_W);
     label(tr("Clock style:"), COL_4, 186, COL_3_W);
-    add_combo(IDC_CLOCK_STYLE_COMBO, COL_4, 206, COL_3_W, &[tr("Large"), tr("Pill"), tr("Analog"), tr("Greeting"), tr("Stacked")]);
+    add_combo(IDC_CLOCK_STYLE_COMBO, COL_4, 206, COL_3_W, &[tr("Large"), tr("Pill"), tr("Analog"), tr("Greeting"), tr("Stacked"), tr("Collage")]);
     label(tr("Position:"), COL_4, 248, COL_3_W);
     add_combo(IDC_CLOCK_POSITION_COMBO, COL_4, 268, COL_3_W, &[tr("In the center"), tr("Top left"), tr("Top right"), tr("On the left"), tr("On the right"), tr("Bottom left"), tr("Bottom right")]);
     label(tr("Size:"), COL_4, 310, COL_3_W);

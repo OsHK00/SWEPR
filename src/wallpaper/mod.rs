@@ -103,6 +103,8 @@ pub fn set_lock_screen(path: &Path) {
     let path = path.to_path_buf();
     std::thread::spawn(move || unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        // De un vídeo, su primer fotograma.
+        let path = crate::canvas::video::windows_image(&path);
         let result = (|| -> windows::core::Result<()> {
             let file = windows::Storage::StorageFile::GetFileFromPathAsync(&windows::core::HSTRING::from(path.as_os_str()))?.get()?;
             windows::System::UserProfile::LockScreen::SetImageFileAsync(&windows::core::Interface::cast::<windows::Storage::IStorageFile>(&file)?)?.get()
@@ -216,6 +218,7 @@ pub fn sync_in_background(path: &Path, monitor_id: Option<String>, style: Wallpa
 
 /// Aplica el fondo a todos los monitores con el fundido nativo de Windows.
 unsafe fn apply_with_fade(path: &Path, style: WallpaperStyle) -> Result<(), String> {
+    let path = &crate::canvas::video::windows_image(path);
     use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, SendMessageTimeoutW, SMTO_NORMAL};
     // Pedir al escritorio que cree su capa WorkerW: sin ella Windows cambia el fondo de golpe.
     if let Ok(progman) = FindWindowW(windows::core::w!("Progman"), None) {
@@ -235,6 +238,8 @@ unsafe fn apply_with_fade(path: &Path, style: WallpaperStyle) -> Result<(), Stri
 
 /// Aplica el fondo sin animación con IDesktopWallpaper (todos los monitores o uno concreto).
 unsafe fn apply_instant(wallpaper: &IDesktopWallpaper, path: &Path, monitor_id: Option<&str>, style: WallpaperStyle) -> Result<(), String> {
+    // Windows no admite vídeos: se le da su primer fotograma.
+    let path = &crate::canvas::video::windows_image(path);
     let wide: Vec<u16> = path.to_string_lossy().encode_utf16().chain(std::iter::once(0)).collect();
     let pcwstr = PCWSTR(wide.as_ptr());
     wallpaper
@@ -306,7 +311,9 @@ impl WallpaperManager {
             if path_str.is_empty() {
                 return Err("Sin fondo de pantalla común a todos los monitores".into());
             }
-            Ok(std::path::PathBuf::from(path_str))
+            let path = std::path::PathBuf::from(path_str);
+            // Si es el fotograma fijo de un vídeo, el fondo es el vídeo.
+            Ok(crate::canvas::video::video_of_still(&path).unwrap_or(path))
         }
     }
 
@@ -339,6 +346,7 @@ impl WallpaperManager {
         unsafe {
             let raw = wallpaper.GetWallpaper(PCWSTR(wide.as_ptr())).ok()?;
             take_com_string(raw).ok().filter(|path| !path.is_empty()).map(PathBuf::from)
+                .map(|path| crate::canvas::video::video_of_still(&path).unwrap_or(path))
         }
     }
 

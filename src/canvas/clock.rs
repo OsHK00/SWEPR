@@ -1,11 +1,13 @@
 //! Reloj del escritorio: se dibuja en el lienzo encima del fondo y debajo de los iconos.
-//! Cuatro estilos (grande, cápsula, analógico y con saludo); el color se adapta a lo claro u
-//! oscuro que sea el fondo en esa zona. Solo se repinta al cambiar el minuto (o el segundo).
+//! Estilos: grande, cápsula, analógico, con saludo, apilado y collage; el color se adapta a lo
+//! claro u oscuro que sea el fondo en esa zona (salvo el collage, que lleva sus propios papeles).
+//! Solo se repinta al cambiar el minuto (o el segundo).
 
 use super::layout::Area;
 use crate::config::{ClockConfig, ClockPosition, ClockSize, ClockStyle};
 use std::collections::HashMap;
-use windows::Win32::Graphics::Direct2D::Common::{D2D1_COLOR_F, D2D_POINT_2F, D2D_RECT_F};
+use windows::Foundation::Numerics::Matrix3x2;
+use windows::Win32::Graphics::Direct2D::Common::{D2D1_COLOR_F, D2D1_FIGURE_BEGIN_FILLED, D2D1_FIGURE_END_CLOSED, D2D_POINT_2F, D2D_RECT_F};
 use windows::Win32::Graphics::Direct2D::{
     ID2D1Factory, ID2D1RenderTarget, ID2D1SolidColorBrush, ID2D1StrokeStyle, D2D1_CAP_STYLE_ROUND, D2D1_DASH_STYLE_SOLID,
     D2D1_DRAW_TEXT_OPTIONS_NONE, D2D1_ELLIPSE, D2D1_LINE_JOIN_ROUND, D2D1_ROUNDED_RECT, D2D1_STROKE_STYLE_PROPERTIES,
@@ -50,10 +52,8 @@ pub fn texts(settings: &ClockConfig, t: LocalTime) -> (Option<String>, String, O
         if settings.seconds { format!("{hour}:{:02}:{:02} {suffix}", t.minute, t.second) } else { format!("{hour}:{:02} {suffix}", t.minute) }
     };
     let date = settings.date.then(|| {
-        const DAYS: [&str; 7] = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
-        const MONTHS: [&str; 12] = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
-        let weekday = crate::i18n::t(DAYS[(t.weekday as usize) % 7]);
-        let month = crate::i18n::t(MONTHS[(t.month.clamp(1, 12) - 1) as usize]);
+        let weekday = weekday_name(t);
+        let month = month_name(t);
         crate::i18n::t("{weekday}, {month} {day}")
             .replace("{weekday}", &weekday)
             .replace("{month}", &month)
@@ -109,12 +109,108 @@ pub fn region_luma(pixels: &[u8], width: u32, height: u32) -> [f32; 9] {
 
 fn color(rgb: (f32, f32, f32), a: f32) -> D2D1_COLOR_F { D2D1_COLOR_F { r: rgb.0, g: rgb.1, b: rgb.2, a } }
 
+/// Fuentes del collage (familia y grosor): cada recorte con una, como letras de revista.
+const COLLAGE_FONTS: [(&str, i32); 6] = [
+    ("Arial Black", 900),
+    ("Georgia", 700),
+    ("Impact", 400),
+    ("Segoe UI", 900),
+    ("Times New Roman", 700),
+    ("Bahnschrift", 700),
+];
+const PAPER: (f32, f32, f32) = (0.97, 0.97, 0.95);
+const INK: (f32, f32, f32) = (0.05, 0.05, 0.06);
+const RED: (f32, f32, f32) = (0.86, 0.06, 0.12);
+
+/// Cómo es un recorte del collage.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    /// Papel blanco, letra negra.
+    Paper,
+    /// Papel negro, letra blanca y borde blanco.
+    Ink,
+    /// Papel rojo, letra blanca.
+    Red,
+    /// Solo la letra (en la franja, o los dos puntos).
+    Bare,
+}
+
+struct Cutout {
+    text: String,
+    /// Centro, en coordenadas del bloque.
+    center: (f32, f32),
+    size: (f32, f32),
+    px: f32,
+    font: usize,
+    kind: Kind,
+    /// Giro en grados.
+    angle: f32,
+    seed: u32,
+}
+
+/// Número pseudoaleatorio estable entre 0 y 1 (mismo resultado para la misma semilla).
+fn noise(seed: u32) -> f32 {
+    let mut x = seed.wrapping_mul(0x9E37_79B9) ^ 0x85EB_CA6B;
+    x ^= x >> 15;
+    x = x.wrapping_mul(0x2C1B_3C6D);
+    x ^= x >> 12;
+    x = x.wrapping_mul(0x297A_2D39);
+    x ^= x >> 15;
+    x as f32 / u32::MAX as f32
+}
+
+/// Como `noise`, entre -1 y 1.
+fn jitter(seed: u32) -> f32 { noise(seed) * 2.0 - 1.0 }
+
+/// Giro de `degrees` alrededor de (cx, cy).
+fn rotation(degrees: f32, cx: f32, cy: f32) -> Matrix3x2 {
+    let (s, c) = degrees.to_radians().sin_cos();
+    Matrix3x2 { M11: c, M12: s, M21: -s, M22: c, M31: cx - cx * c + cy * s, M32: cy - cx * s - cy * c }
+}
+
+/// Primero `a`, después `b`.
+fn mul(a: &Matrix3x2, b: &Matrix3x2) -> Matrix3x2 {
+    Matrix3x2 {
+        M11: a.M11 * b.M11 + a.M12 * b.M21,
+        M12: a.M11 * b.M12 + a.M12 * b.M22,
+        M21: a.M21 * b.M11 + a.M22 * b.M21,
+        M22: a.M21 * b.M12 + a.M22 * b.M22,
+        M31: a.M31 * b.M11 + a.M32 * b.M21 + b.M31,
+        M32: a.M31 * b.M12 + a.M32 * b.M22 + b.M32,
+    }
+}
+
+unsafe fn fill_polygon(target: &ID2D1RenderTarget, factory: &ID2D1Factory, brush: &ID2D1SolidColorBrush, points: &[D2D_POINT_2F], fill: D2D1_COLOR_F) {
+    let Ok(geometry) = factory.CreatePathGeometry() else { return; };
+    let Ok(sink) = geometry.Open() else { return; };
+    sink.BeginFigure(points[0], D2D1_FIGURE_BEGIN_FILLED);
+    sink.AddLines(&points[1..]);
+    sink.EndFigure(D2D1_FIGURE_END_CLOSED);
+    if sink.Close().is_err() { return; }
+    brush.SetColor(&fill);
+    target.FillGeometry(&geometry, brush, None);
+}
+
+/// Nombre del día de la semana, traducido.
+fn weekday_name(t: LocalTime) -> String {
+    const DAYS: [&str; 7] = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+    crate::i18n::t(DAYS[(t.weekday as usize) % 7])
+}
+
+/// Nombre del mes, traducido.
+fn month_name(t: LocalTime) -> String {
+    const MONTHS: [&str; 12] = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+    crate::i18n::t(MONTHS[(t.month.clamp(1, 12) - 1) as usize])
+}
+
 const FONT: &str = "Segoe UI Variable Display";
 
 pub struct ClockPainter {
     dwrite: IDWriteFactory,
-    formats: HashMap<(u32, i32, i32), IDWriteTextFormat>,
+    formats: HashMap<(&'static str, u32, i32, i32), IDWriteTextFormat>,
     round: Option<ID2D1StrokeStyle>,
+    /// Proporciones de cada fuente (ascendente, altura de cifras), para no consultarlas cada vez.
+    ratios: HashMap<(&'static str, i32), (f32, f32)>,
 }
 
 impl ClockPainter {
@@ -131,14 +227,18 @@ impl ClockPainter {
                 dashOffset: 0.0,
             };
             let round = factory.CreateStrokeStyle(&properties, None).ok();
-            Some(Self { dwrite, formats: HashMap::new(), round })
+            Some(Self { dwrite, formats: HashMap::new(), round, ratios: HashMap::new() })
         }
     }
 
     fn format(&mut self, size: f32, weight: DWRITE_FONT_WEIGHT, align: DWRITE_TEXT_ALIGNMENT) -> Option<IDWriteTextFormat> {
-        let key = (size.round() as u32, weight.0, align.0);
+        self.format_with(FONT, size, weight, align)
+    }
+
+    fn format_with(&mut self, family: &'static str, size: f32, weight: DWRITE_FONT_WEIGHT, align: DWRITE_TEXT_ALIGNMENT) -> Option<IDWriteTextFormat> {
+        let key = (family, size.round() as u32, weight.0, align.0);
         if let Some(format) = self.formats.get(&key) { return Some(format.clone()); }
-        let family_w: Vec<u16> = FONT.encode_utf16().chain(std::iter::once(0)).collect();
+        let family_w: Vec<u16> = family.encode_utf16().chain(std::iter::once(0)).collect();
         let format = unsafe {
             let format = self.dwrite.CreateTextFormat(windows::core::PCWSTR(family_w.as_ptr()), None, weight, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, size.round().max(1.0), windows::core::w!("")).ok()?;
             let _ = format.SetTextAlignment(align);
@@ -146,7 +246,7 @@ impl ClockPainter {
             format
         };
         // Pocas combinaciones; se limpia si crecen (cambios de tamaño o de monitor).
-        if self.formats.len() > 24 { self.formats.clear(); }
+        if self.formats.len() > 64 { self.formats.clear(); }
         self.formats.insert(key, format.clone());
         Some(format)
     }
@@ -173,6 +273,7 @@ impl ClockPainter {
             ClockStyle::Analog => self.draw_analog(target, factory, &brush, area, settings, light_bg, size, now, date),
             ClockStyle::Pill => self.draw_pill(target, &brush, area, settings, light_bg, size, &time, date),
             ClockStyle::Stacked => self.draw_stacked(target, &brush, area, settings, light_bg, size, now, date),
+            ClockStyle::Collage => self.draw_collage(target, factory, &brush, area, settings, size, &time, now),
             ClockStyle::Large | ClockStyle::Greeting => self.draw_large(target, &brush, area, settings, light_bg, size, greeting, &time, date),
         }
     }
@@ -195,6 +296,200 @@ impl ClockPainter {
             let em = metrics.designUnitsPerEm.max(1) as f32;
             (metrics.ascent as f32 / em, metrics.capHeight as f32 / em)
         }
+    }
+
+    /// Collage de recortes de revista: cada cifra en su propio recorte inclinado, con otra
+    /// fuente; blanco, negro y un toque rojo, con sombra dura. Debajo, el día de la semana en
+    /// una franja negra sesgada y el día del mes con el mes en dos recortes más.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_collage(&mut self, target: &ID2D1RenderTarget, factory: &ID2D1Factory, brush: &ID2D1SolidColorBrush, area: Area, settings: &ClockConfig, size: f32, time: &str, t: LocalTime) {
+        let unit = 200.0 * size;
+        // Semilla por minuto del día: los recortes cambian de forma con la hora, no a cada repintado.
+        let base_seed = 7919;
+
+        // Fila de la hora: cifras sueltas; los dos puntos en rojo sin recorte; segundos y AM/PM más pequeños.
+        let mut row: Vec<Cutout> = Vec::new();
+        let mut x = 0.0f32;
+        let mut colons = 0;
+        let mut tokens: Vec<String> = Vec::new();
+        for c in time.chars() {
+            match tokens.last_mut() {
+                Some(last) if c.is_alphabetic() && last.chars().all(char::is_alphabetic) => last.push(c),
+                _ => tokens.push(c.to_string()),
+            }
+        }
+        let digit_count = tokens.iter().filter(|tok| tok.chars().all(|c| c.is_ascii_digit())).count().max(1);
+        let red_digit = (noise(base_seed + t.hour as u32 * 61 + t.minute as u32) * digit_count as f32) as usize % digit_count;
+        let mut digit_index = 0;
+        for (i, token) in tokens.iter().enumerate() {
+            let seed = base_seed.wrapping_add(i as u32 * 131).wrapping_add(token.chars().next().map(|c| c as u32).unwrap_or(0) * 17);
+            if token == " " { x += unit * 0.12; continue; }
+            if token == ":" {
+                colons += 1;
+                let px = unit * if colons > 1 { 0.6 } else { 0.85 };
+                let (w, _) = self.cutout_size(":", px, 0);
+                row.push(Cutout { text: ":".into(), center: (x + w * 0.5, unit * 0.5), size: (w, unit * 0.6), px, font: 0, kind: Kind::Bare, angle: jitter(seed) * 6.0, seed });
+                x += w * 0.9;
+                continue;
+            }
+            let small = colons > 1 || token.chars().all(char::is_alphabetic);
+            let scale = if small { 0.6 } else { 1.0 };
+            let px = unit * 0.8 * scale * (1.0 + 0.2 * jitter(seed + 3));
+            let font = (noise(seed + 5) * COLLAGE_FONTS.len() as f32) as usize % COLLAGE_FONTS.len();
+            let (w, h) = self.cutout_size(token, px, font);
+            let kind = if token.chars().all(|c| c.is_ascii_digit()) {
+                digit_index += 1;
+                if digit_index - 1 == red_digit { Kind::Red } else if noise(seed + 9) < 0.3 { Kind::Ink } else { Kind::Paper }
+            } else {
+                Kind::Red
+            };
+            // Los pequeños se apoyan abajo, como recortes pegados al lado.
+            let cy = if small { unit - h * 0.45 } else { unit * 0.5 + jitter(seed + 11) * unit * 0.08 };
+            row.push(Cutout { text: token.clone(), center: (x + w * 0.5, cy), size: (w, h), px, font, kind, angle: jitter(seed + 13) * 10.0, seed });
+            x += w * 0.94;
+        }
+        let row_w = x;
+
+        // Día de la semana en una franja y, al lado, el día y el mes.
+        let mut banner: Option<(Vec<Cutout>, D2D_RECT_F)> = None;
+        let mut date_cuts: Vec<Cutout> = Vec::new();
+        if settings.date {
+            let band_h = unit * 0.46;
+            let band_left = row_w * 0.16;
+            let band_top = unit * 1.06;
+            let mut letters = Vec::new();
+            let mut lx = band_left + band_h * 0.45;
+            for (i, letter) in weekday_name(t).to_uppercase().chars().enumerate() {
+                let seed = base_seed.wrapping_add(1000 + i as u32 * 37 + letter as u32);
+                let font = (noise(seed) * COLLAGE_FONTS.len() as f32) as usize % COLLAGE_FONTS.len();
+                let px = band_h * 0.66 * (1.0 + 0.14 * jitter(seed + 1));
+                let text = letter.to_string();
+                let (w, h) = self.cutout_size(&text, px, font);
+                let kind = if noise(seed + 2) < 0.22 { Kind::Paper } else { Kind::Bare };
+                let w = if kind == Kind::Bare { w * 0.78 } else { w };
+                letters.push(Cutout { text, center: (lx + w * 0.5, band_top + band_h * 0.5 + jitter(seed + 3) * band_h * 0.06), size: (w, h * 0.9), px, font, kind, angle: jitter(seed + 4) * 8.0, seed });
+                lx += w * 0.92;
+            }
+            let band = D2D_RECT_F { left: band_left, top: band_top, right: lx + band_h * 0.45, bottom: band_top + band_h };
+            // Día del mes (rojo) y mes abreviado, solapando el final de la franja.
+            let day_seed = base_seed + 2000 + t.day as u32;
+            let day = t.day.to_string();
+            let (dw, dh) = self.cutout_size(&day, unit * 0.46, 1);
+            let day_x = band.right - dw * 0.15;
+            date_cuts.push(Cutout { text: day, center: (day_x + dw * 0.5, band_top + band_h * 0.42), size: (dw, dh), px: unit * 0.46, font: 1, kind: Kind::Red, angle: jitter(day_seed) * 6.0 - 4.0, seed: day_seed });
+            let month: String = month_name(t).chars().take(3).collect::<String>().to_uppercase();
+            let (mw, mh) = self.cutout_size(&month, unit * 0.3, 0);
+            let month_x = day_x + dw * 0.85;
+            date_cuts.push(Cutout { text: month, center: (month_x + mw * 0.5, band_top + band_h * 0.62), size: (mw, mh), px: unit * 0.3, font: 0, kind: Kind::Paper, angle: jitter(day_seed + 1) * 6.0 + 3.0, seed: day_seed + 1 });
+            banner = Some((letters, band));
+        }
+
+        // Caja total (con margen por las inclinaciones) y colocación en el monitor.
+        let mut right = row_w;
+        let mut bottom = unit;
+        if let Some((_, band)) = &banner { bottom = bottom.max(band.bottom); right = right.max(band.right); }
+        for cut in &date_cuts { right = right.max(cut.center.0 + cut.size.0 * 0.5); bottom = bottom.max(cut.center.1 + cut.size.1 * 0.5); }
+        let margin = unit * 0.16;
+        let (px0, py0) = Self::place(area, settings.position, right + margin * 2.0, bottom + margin * 2.0, size);
+        let (ox, oy) = (px0 + margin, py0 + margin);
+
+        unsafe {
+            let mut saved = Matrix3x2::identity();
+            target.GetTransform(&mut saved);
+            // Todo el bloque, un poco inclinado.
+            let group = mul(&rotation(-7.0, right * 0.5, bottom * 0.5), &mul(&Matrix3x2::translation(ox, oy), &saved));
+            for cut in &row {
+                self.draw_cutout(target, factory, brush, cut, &group);
+            }
+            if let Some((letters, band)) = &banner {
+                let band_group = mul(&rotation(3.0, (band.left + band.right) * 0.5, (band.top + band.bottom) * 0.5), &group);
+                target.SetTransform(&band_group);
+                let skew = (band.bottom - band.top) * 0.35;
+                let corners = |grow: f32, dx: f32, dy: f32| -> [D2D_POINT_2F; 4] {
+                    [
+                        D2D_POINT_2F { x: band.left + skew - grow + dx, y: band.top - grow + dy },
+                        D2D_POINT_2F { x: band.right + grow + dx, y: band.top - grow * 0.6 + dy },
+                        D2D_POINT_2F { x: band.right - skew + grow + dx, y: band.bottom + grow + dy },
+                        D2D_POINT_2F { x: band.left - grow + dx, y: band.bottom + grow * 0.6 + dy },
+                    ]
+                };
+                let shadow = unit * 0.05;
+                fill_polygon(target, factory, brush, &corners(unit * 0.035, shadow, shadow * 1.2), color((0.0, 0.0, 0.0), 0.9));
+                fill_polygon(target, factory, brush, &corners(unit * 0.035, 0.0, 0.0), color(PAPER, 1.0));
+                fill_polygon(target, factory, brush, &corners(0.0, 0.0, 0.0), color(INK, 1.0));
+                for cut in letters {
+                    self.draw_cutout(target, factory, brush, cut, &band_group);
+                }
+            }
+            for cut in &date_cuts {
+                self.draw_cutout(target, factory, brush, cut, &group);
+            }
+            target.SetTransform(&saved);
+        }
+    }
+
+    /// Ancho y alto del recorte de `text` a `px` con la fuente `font` del collage.
+    fn cutout_size(&mut self, text: &str, px: f32, font: usize) -> (f32, f32) {
+        let (family, weight) = COLLAGE_FONTS[font % COLLAGE_FONTS.len()];
+        let Some(format) = self.format_with(family, px, DWRITE_FONT_WEIGHT(weight), DWRITE_TEXT_ALIGNMENT_CENTER) else { return (px, px); };
+        let (w, _) = self.measure(text, &format);
+        let (_, cap) = self.cached_ratios(family, DWRITE_FONT_WEIGHT(weight));
+        (w + px * 0.3, cap * px + px * 0.36)
+    }
+
+    /// Un recorte: sombra dura, borde, cara y su letra, girado sobre su centro.
+    unsafe fn draw_cutout(&mut self, target: &ID2D1RenderTarget, factory: &ID2D1Factory, brush: &ID2D1SolidColorBrush, cut: &Cutout, group: &Matrix3x2) {
+        let (cx, cy) = cut.center;
+        target.SetTransform(&mul(&rotation(cut.angle, cx, cy), group));
+        let (w, h) = cut.size;
+        let (face, ink, edge) = match cut.kind {
+            Kind::Paper => (PAPER, INK, INK),
+            Kind::Ink => (INK, PAPER, PAPER),
+            Kind::Red => (RED, PAPER, INK),
+            Kind::Bare => (INK, if cut.text == ":" { RED } else { PAPER }, INK),
+        };
+        if cut.kind != Kind::Bare {
+            // Esquinas un poco irregulares, como cortadas a tijera (siempre igual para la misma semilla).
+            let rough = w.min(h) * 0.07;
+            let quad = |grow: f32, dx: f32, dy: f32| -> [D2D_POINT_2F; 4] {
+                let corner = |i: u32, sx: f32, sy: f32| D2D_POINT_2F {
+                    x: cx + sx * (w * 0.5 + grow) + jitter(cut.seed + 20 + i) * rough + dx,
+                    y: cy + sy * (h * 0.5 + grow) + jitter(cut.seed + 30 + i) * rough + dy,
+                };
+                [corner(0, -1.0, -1.0), corner(1, 1.0, -1.0), corner(2, 1.0, 1.0), corner(3, -1.0, 1.0)]
+            };
+            let border = h * 0.07;
+            let shadow = h * 0.08;
+            fill_polygon(target, factory, brush, &quad(border, shadow, shadow * 1.25), color((0.0, 0.0, 0.0), 0.9));
+            fill_polygon(target, factory, brush, &quad(border, 0.0, 0.0), color(edge, 1.0));
+            fill_polygon(target, factory, brush, &quad(0.0, 0.0, 0.0), color(face, 1.0));
+        }
+        let (family, weight) = COLLAGE_FONTS[cut.font % COLLAGE_FONTS.len()];
+        let weight = DWRITE_FONT_WEIGHT(weight);
+        let Some(format) = self.format_with(family, cut.px, weight, DWRITE_TEXT_ALIGNMENT_CENTER) else { return; };
+        let (ascent, cap) = self.cached_ratios(family, weight);
+        // Centra la altura de las mayúsculas y cifras en el recorte.
+        let top = cy - (ascent - cap * 0.5) * cut.px;
+        let rect = D2D_RECT_F { left: cx - w * 2.0, top, right: cx + w * 2.0, bottom: top + cut.px * 1.6 };
+        let wide: Vec<u16> = cut.text.encode_utf16().collect();
+        if cut.kind == Kind::Bare {
+            // Sin recorte: contorno oscuro para que se lea sobre la franja y sobre el fondo.
+            brush.SetColor(&color((0.0, 0.0, 0.0), 0.9));
+            let o = cut.px * 0.04;
+            for (dx, dy) in [(-o, 0.0), (o, 0.0), (0.0, -o), (0.0, o), (o, o * 1.6)] {
+                let r = D2D_RECT_F { left: rect.left + dx, right: rect.right + dx, top: rect.top + dy, bottom: rect.bottom + dy };
+                target.DrawText(&wide, &format, &r, brush, D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL);
+            }
+        }
+        brush.SetColor(&color(ink, 1.0));
+        target.DrawText(&wide, &format, &rect, brush, D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL);
+    }
+
+    fn cached_ratios(&mut self, family: &'static str, weight: DWRITE_FONT_WEIGHT) -> (f32, f32) {
+        if let Some(r) = self.ratios.get(&(family, weight.0)) { return *r; }
+        let r = self.font_ratios(family, weight);
+        self.ratios.insert((family, weight.0), r);
+        r
     }
 
     /// Cifras gruesas en dos filas (horas y minutos; los segundos, en una tercera más tenue),
@@ -498,6 +793,8 @@ mod tests {
             let cases: Vec<(&str, ClockConfig)> = cases.into_iter().chain([
                 ("stacked", ClockConfig { enabled: true, style: ClockStyle::Stacked, position: ClockPosition::Center, ..Default::default() }),
                 ("stacked-left", ClockConfig { enabled: true, style: ClockStyle::Stacked, position: ClockPosition::Left, seconds: true, ..Default::default() }),
+                ("collage", ClockConfig { enabled: true, style: ClockStyle::Collage, position: ClockPosition::Center, ..Default::default() }),
+                ("collage-corner", ClockConfig { enabled: true, style: ClockStyle::Collage, position: ClockPosition::BottomRight, hour24: false, seconds: true, ..Default::default() }),
             ]).collect();
             for (name, settings) in cases {
                 target.BeginDraw();

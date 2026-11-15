@@ -29,10 +29,10 @@ SWEPR runs in the system tray and lets you browse a folder of images, preview th
 
 ## Features
 
-- Scans a wallpaper folder for JPG, JPEG, JFIF, PNG, BMP, WebP, GIF, and TIFF images, with optional subfolder scanning. The gallery can be sorted by name or by date.
+- Scans a wallpaper folder for JPG, JPEG, JFIF, PNG, BMP, WebP, GIF, and TIFF images (and videos), with optional subfolder scanning. The gallery can be sorted by name or by date.
 - Opens a thumbnail panel from screen edge sensors or a keyboard shortcut. Three panel modes are available: Low power, a thumbnail strip at the top, left, or right edge of the screen; Pro, a full-screen gallery in one of five styles (Showcase with slanted cards and actions, Fan, Mosaic with search, Frame with the image in large inside a light frame and the thumbnails in a cascade, or the classic carousel); and Notch, a black island at the top of the screen that grows from a small pill into a gallery, like a phone notch.
 - The Pro styles have filters for all images, favorites, and new ones, color chips based on each image's dominant color, and search by name (just start typing).
-- With the SWEPR canvas, GIF and animated WebP wallpapers play behind the desktop icons and pause during full-screen apps, under maximized windows, while the session is locked, and with battery saver on.
+- With the SWEPR canvas, GIF and animated WebP wallpapers, and MP4, MOV, MKV, WebM, WMV, and AVI videos (silent, in a loop), play behind the desktop icons and pause during full-screen apps, under maximized windows, while the session is locked, and with battery saver on.
 - With the SWEPR canvas, a desktop clock can be shown behind the icons in five styles (Large, Pill, Analog, with a greeting, or Stacked hours and minutes), in the center, a corner, or on the left or right edge, and its color adapts to the wallpaper.
 - With the SWEPR canvas, the image you are browsing in the Notch or a Pro style is previewed on the desktop behind the icons, and the desktop goes back to the current wallpaper if you close without applying.
 - When the wallpaper changes from a shortcut, the tray, an automatic change, or a panel, the notch can show a short notice with a thumbnail and the name of the new wallpaper.
@@ -98,6 +98,7 @@ Translation files are JSON files in `languages`, named with a language code such
 │   ├── canvas/
 │   │   ├── mod.rs           SWEPR canvas: window behind the icons, Direct2D drawing, WIC decoding
 │   │   ├── anim.rs          Animated wallpapers: GIF/WebP frames, memory budget, and pauses
+│   │   ├── video.rs         Video wallpapers: Media Foundation playback and first-frame stills
 │   │   ├── clock.rs         Desktop clock styles drawn on the canvas
 │   │   └── layout.rs        Where each image is drawn for every fit mode
 │   ├── config/
